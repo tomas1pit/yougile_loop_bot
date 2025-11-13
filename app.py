@@ -178,11 +178,21 @@ def yg_create_task(title, column_id, description="", assignee_id=None, deadline=
         "columnId": column_id,
         "description": description,
     }
+
+    # назначенный исполнитель
     if assignee_id:
-        body["executorId"] = assignee_id
+        body["assigned"] = [assignee_id]
+
+    # дедлайн в формате YouGile
     if deadline:
-        # допустим, API принимает ISO8601
-        body["deadline"] = deadline.isoformat()
+        # deadline у нас date, превращаем в 00:00 локального дня и далее в миллисекунды
+        dt = datetime(deadline.year, deadline.month, deadline.day)
+        ms = int(dt.timestamp() * 1000)
+        body["deadline"] = {
+            "deadline": ms,
+            "startDate": ms,
+            "withTime": False,
+        }
 
     r = requests.post(
         f"{YOUGILE_BASE_URL}/tasks",
@@ -190,6 +200,10 @@ def yg_create_task(title, column_id, description="", assignee_id=None, deadline=
         json=body,
         timeout=10,
     )
+
+    # на время отладки можно раскомментировать:
+    # print("YG create task status:", r.status_code, "body:", r.text)
+
     r.raise_for_status()
     return r.json()
 
@@ -584,10 +598,25 @@ def mm_actions():
             if not assignee_id:
                 return "", 200
 
+            # сохраняем исполнителя
             state = set_state(user_id, root_post_id, {
                 "step": "CHOOSE_ASSIGNEE",
                 "assignee_id": assignee_id,
             })
+
+            # вытаскиваем project_id из state
+            project_id = state.get("project_id") or context.get("project_id")
+
+            # берём список пользователей проекта, чтобы найти имя
+            assignee_name = assignee_id
+            try:
+                users = yg_get_project_users(project_id)
+                for u in users:
+                    if u.get("id") == assignee_id:
+                        assignee_name = u.get("realName") or u.get("email") or assignee_id
+                        break
+            except Exception as e:
+                print("Error fetching project users for assignee name:", e)
 
             meta = {
                 "project_id": state.get("project_id"),
@@ -597,10 +626,10 @@ def mm_actions():
             }
             attachments = build_deadline_buttons(task_title, meta, user_id, root_post_id)
 
-            # затираем select с исполнителем
+            # затираем select с исполнителем и показываем, кто выбран
             mm_patch_post(
                 post_id,
-                message=f'Ответственный для задачи "{task_title}" выбран.',
+                message=f'Ответственный для задачи "{task_title}": {assignee_name}',
                 attachments=[]
             )
 
