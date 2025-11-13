@@ -21,6 +21,10 @@ def slugify_title(title: str) -> str:
     return quote(s)
 
 # ---------- ENV ----------
+YOUGILE_TEAM_ID = os.getenv("YOUGILE_TEAM_ID")
+if not YOUGILE_TEAM_ID and YOUGILE_COMPANY_ID:
+    # Берём последний сегмент UUID как team-id (как в твоём URL)
+    YOUGILE_TEAM_ID = YOUGILE_COMPANY_ID.split("-")[-1]
 MM_URL = os.getenv("MM_URL").rstrip("/")
 MM_BOT_TOKEN = os.getenv("MM_BOT_TOKEN")
 MM_BOT_USERNAME = os.getenv("MM_BOT_USERNAME", "yougile_bot").lower()  # без @
@@ -413,6 +417,7 @@ def build_deadline_buttons(task_title, meta, user_id, root_post_id):
         }
 
     actions = [
+        act("dlNone", "Без дедлайна", "none"),
         act("dlToday", "Сегодня", "today"),
         act("dlTomorrow", "Завтра", "tomorrow"),
         act("dlDayAfter", "Послезавтра", "day_after_tomorrow"),
@@ -515,7 +520,12 @@ def mm_actions():
                 # одна доска — сразу идём к колонкам
                 board = boards[0]
                 board_id = board["id"]
-                state = set_state(user_id, root_post_id, {"board_id": board_id})
+                board_title = board.get("title", "без названия")
+
+                state = set_state(user_id, root_post_id, {
+                    "board_id": board_id,
+                    "board_title": board_title,
+                })
 
                 columns = yg_get_columns(board_id)
                 attachments = build_column_buttons(
@@ -554,6 +564,7 @@ def mm_actions():
                 "step": "CHOOSE_BOARD",
                 "project_id": project_id,
                 "board_id": board_id,
+                "board_title": board_title,
             })
 
             columns = yg_get_columns(board_id)
@@ -627,6 +638,7 @@ def mm_actions():
             state = set_state(user_id, root_post_id, {
                 "step": "CHOOSE_ASSIGNEE",
                 "assignee_id": assignee_id,
+                "assignee_name": assignee_name,
             })
 
             # вытаскиваем project_id из state
@@ -686,10 +698,13 @@ def mm_actions():
                     ),
                     attachments=[]
                 )
+            elif deadline_choice == "none":
+                # Без дедлайна
+                state = set_state(user_id, root_post_id, {"deadline": None})
+                create_task_and_update_post(task_title, state, user_id, post_id)
             else:
                 deadline_date = calc_deadline(deadline_choice)
                 state = set_state(user_id, root_post_id, {"deadline": deadline_date})
-                # создаём задачу сразу
                 create_task_and_update_post(task_title, state, user_id, post_id)
 
         # ---------- ОТМЕНА ----------
@@ -724,12 +739,45 @@ def mm_actions():
 
         # ---------- ЗАВЕРШЕНИЕ ДИАЛОГА ----------
         elif step == "FINISH":
-            clear_state(user_id, root_post_id)
+            st = get_state(user_id, root_post_id) or {}
+
+            project_title = st.get("project_title", "без названия")
+            board_title = st.get("board_title", "без названия")
+            assignee_name = st.get("assignee_name", "не указан")
+            deadline_str = st.get("deadline_str", "без дедлайна")
+            task_url = st.get("task_url", "")
+
+            channel_id_state = st.get("channel_id", channel_id)
+
+            summary = (
+                f'Задача "{task_title}" создана в проекте: {project_title}, '
+                f'доска: {board_title}, ответственный: {assignee_name}, '
+                f'дедлайн: {deadline_str}.'
+            )
+            if task_url:
+                summary += f"\nСсылка: {task_url}"
+
+            # сообщение в треде
+            mm_post(
+                channel_id_state,
+                message=summary,
+                root_id=root_post_id
+            )
+
+            # сообщение в сам канал (без треда)
+            mm_post(
+                channel_id_state,
+                message=summary
+            )
+
+            # optionally – подчистим сообщение с кнопкой
             mm_patch_post(
                 post_id,
                 message=f'Диалог по задаче "{task_title}" завершён.',
                 attachments=[]
             )
+
+            clear_state(user_id, root_post_id)
 
     except Exception as e:
         print("Error in mm_actions:", e)
@@ -741,7 +789,7 @@ def mm_actions():
     return "", 200
 
 def create_task_and_update_post(task_title, state, user_id, post_id):
-    # Автор в комментариях — FirstName LastName из Mattermost
+    # Автор в описании — FirstName LastName из Mattermost
     mm_user = mm_get_user(user_id)
     first_name = mm_user.get("first_name", "").strip()
     last_name = mm_user.get("last_name", "").strip()
@@ -754,24 +802,42 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
 
     description = f"Создано из Loop пользователем {full_name} (@{username})"
 
-    task = yg_create_task(task_title, column_id, description=description, assignee_id=assignee_id, deadline=deadline)
+    # создаём задачу
+    task = yg_create_task(
+        task_title,
+        column_id,
+        description=description,
+        assignee_id=assignee_id,
+        deadline=deadline
+    )
     task_id = task.get("id")
-    task_project_id = task.get("idTaskProject") or task.get("idTaskCommon")
 
-    # пробуем собрать "красивую" ссылку
+    # подтягиваем полную задачу, чтобы получить idTaskProject
+    task_project_id = task.get("idTaskProject") or task.get("idTaskCommon")
+    try:
+        if task_id and not task_project_id:
+            full_task = yg_get_task(task_id)
+            task_project_id = full_task.get("idTaskProject") or full_task.get("idTaskCommon")
+    except Exception as e:
+        print("Error fetching full YouGile task:", e)
+
+    # красивый URL
     project_title = state.get("project_title")
     project_slug = slugify_title(project_title) if project_title else ""
-    company_id = YOUGILE_COMPANY_ID
+    team_id = YOUGILE_TEAM_ID or YOUGILE_COMPANY_ID
 
-    if company_id and project_slug and task_project_id:
-        task_url = f"https://ru.yougile.com/team/{company_id}/{project_slug}#{task_project_id}"
+    if team_id and project_slug and task_project_id:
+        task_url = f"https://ru.yougile.com/team/{team_id}/{project_slug}#{task_project_id}"
+    elif team_id:
+        task_url = f"https://ru.yougile.com/team/{team_id}"
     else:
-        # fallback — вдруг что-то не пришло
-        task_url = f"https://ru.yougile.com/team/{company_id}" if company_id else ""
+        task_url = "https://ru.yougile.com/"
 
-    meta = {
-        "yougile_task_id": task_id,
-    }
+    # человекочитаемый дедлайн
+    if deadline:
+        deadline_str = deadline.strftime("%d.%m.%Y")
+    else:
+        deadline_str = "без дедлайна"
 
     meta = {
         "yougile_task_id": task_id,
@@ -780,15 +846,20 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
 
     mm_patch_post(
         post_id,
-        message=f'✅ Задача "{task_title}" создана.\nСсылка: {task_url}\n'
-                f'Можете оставить дополнительный комментарий в треде, затем нажмите \"Завершить\".',
+        message=(
+            f'✅ Задача "{task_title}" создана.\n'
+            f'Ссылка: {task_url}\n'
+            f'Можете оставить дополнительный комментарий в треде, затем нажмите "Завершить".'
+        ),
         attachments=attachments
     )
 
+    # сохраняем всё нужное для финального резюме
     set_state(user_id, state.get("root_post_id"), {
         "step": "OPTIONAL_ATTACH",
         "yougile_task_id": task_id,
         "task_url": task_url,
+        "deadline_str": deadline_str,
     })
 
 
