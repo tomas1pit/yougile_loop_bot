@@ -127,11 +127,11 @@ def parse_create_command(message: str, bot_username: str):
 def yg_get_projects():
     r = requests.get(f"{YOUGILE_BASE_URL}/projects", headers=yg_headers, timeout=10)
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    return data.get("content", [])
 
 
 def yg_get_boards(project_id):
-    # пример: ?projectId
     r = requests.get(
         f"{YOUGILE_BASE_URL}/boards",
         headers=yg_headers,
@@ -139,7 +139,8 @@ def yg_get_boards(project_id):
         timeout=10
     )
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    return data.get("content", [])
 
 
 def yg_get_columns(board_id):
@@ -150,7 +151,8 @@ def yg_get_columns(board_id):
         timeout=10
     )
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    return data.get("content", [])
 
 
 def yg_get_board_users(board_id):
@@ -161,7 +163,8 @@ def yg_get_board_users(board_id):
         timeout=10
     )
     r.raise_for_status()
-    return r.json()
+    data = r.json()
+    return data.get("content", [])
 
 
 def yg_create_task(title, column_id, description="", assignee_id=None, deadline=None):
@@ -220,7 +223,7 @@ def build_project_buttons(task_title, projects, user_id, root_post_id):
     for p in projects:
         actions.append({
             "id": f"project_{p['id']}",
-            "name": p.get("name", "Без имени"),
+            "name": p.get("title", "Без имени"),
             "type": "button",
             "integration": {
                 "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
@@ -234,7 +237,7 @@ def build_project_buttons(task_title, projects, user_id, root_post_id):
             }
         })
     return [{
-        "text": f"Проекты:",
+        "text": "Проекты:",
         "actions": actions
     }]
 
@@ -244,7 +247,7 @@ def build_board_buttons(task_title, project_id, boards, user_id, root_post_id):
     for b in boards:
         actions.append({
             "id": f"board_{b['id']}",
-            "name": b.get("name", "Без имени"),
+            "name": b.get("title", "Без имени"),
             "type": "button",
             "integration": {
                 "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
@@ -269,7 +272,7 @@ def build_column_buttons(task_title, project_id, board_id, columns, user_id, roo
     for c in columns:
         actions.append({
             "id": f"col_{c['id']}",
-            "name": c.get("name", "Без имени"),
+            "name": c.get("title", "Без имени"),
             "type": "button",
             "integration": {
                 "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
@@ -293,7 +296,7 @@ def build_column_buttons(task_title, project_id, board_id, columns, user_id, roo
 def build_assignee_select(task_title, project_id, board_id, column_id, users, user_id, root_post_id):
     options = []
     for u in users:
-        full_name = (u.get("firstName", "") + " " + u.get("lastName", "")).strip() or u.get("displayName", "Без имени")
+        full_name = u.get("realName", "") or u.get("email", "Без имени")
         options.append({
             "text": full_name,
             "value": u["id"]
