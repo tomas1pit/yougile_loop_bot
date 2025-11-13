@@ -1,3 +1,21 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Mattermost → YouGile бот.
+
+Функции:
+- При сообщении вида `@yougile_bot создай задачу <название>`
+  запускает интерактивный мастер:
+  проект → доска → колонка → исполнитель → дедлайн → создание задачи в YouGile.
+- Поддерживает:
+  - выбор стандартного дедлайна (сегодня / завтра / послезавтра / неделя / месяц),
+  - кастомную дату YYYY-MM-DD,
+  - необязательный дедлайн ("Без дедлайна"),
+  - дополнение описания задачи текстом из треда,
+  - отмену создания задачи на любом шаге,
+  - автозавершение диалога, если пользователь забыл нажать "Завершить".
+"""
+
 import os
 import json
 import time
@@ -5,82 +23,116 @@ import threading
 import re
 from datetime import datetime, timedelta, date, timezone
 from collections import defaultdict
-
-import requests
-from flask import Flask, request, jsonify
-from websocket import create_connection, WebSocketConnectionClosedException
-
 from urllib.parse import quote
 
+import requests
+from flask import Flask, request
+from websocket import create_connection, WebSocketConnectionClosedException
+
+
+# ---------------------------------------------------------------------------
+#  Вспомогательное: преобразование названия проекта в slug для URL
+# ---------------------------------------------------------------------------
+
 def slugify_title(title: str) -> str:
+    """
+    Превращает название проекта в slug для URL YouGile:
+    - пробелы → дефисы
+    - несколько дефисов подряд схлопываются
+    - строка URL-энкодится
+    """
     s = (title or "").strip()
-    # пробелы → дефисы
-    s = re.sub(r"\s+", "-", s)
-    # схлопываем повторяющиеся дефисы
-    s = re.sub(r"-+", "-", s)
+    s = re.sub(r"\s+", "-", s)   # пробелы → дефисы
+    s = re.sub(r"-+", "-", s)    # схлопываем повторяющиеся дефисы
     return quote(s)
 
-# ---------- ENV ----------
+
+# ---------------------------------------------------------------------------
+#  ENV / конфиг
+# ---------------------------------------------------------------------------
+
+# Через сколько минут после неактивности автозавершать диалог (OPTIONAL_ATTACH)
 AUTO_FINISH_TIMEOUT_MINUTES = int(os.getenv("AUTO_FINISH_TIMEOUT_MINUTES", "5"))
-MM_URL = os.getenv("MM_URL").rstrip("/")
+
+MM_URL = os.getenv("MM_URL", "").rstrip("/")
 MM_BOT_TOKEN = os.getenv("MM_BOT_TOKEN")
 MM_BOT_USERNAME = os.getenv("MM_BOT_USERNAME", "yougile_bot").lower()  # без @
-BOT_PUBLIC_URL = os.getenv("BOT_PUBLIC_URL").rstrip("/")
+BOT_PUBLIC_URL = os.getenv("BOT_PUBLIC_URL", "").rstrip("/")
 
 YOUGILE_COMPANY_ID = os.getenv("YOUGILE_COMPANY_ID")
 YOUGILE_API_KEY = os.getenv("YOUGILE_API_KEY")
 YOUGILE_BASE_URL = os.getenv("YOUGILE_BASE_URL", "https://yougile.com/api-v2").rstrip("/")
 YOUGILE_TEAM_ID = os.getenv("YOUGILE_TEAM_ID")
+
+# Если явно не указан TEAM_ID, пытаемся получить его из COMPANY_ID, как в твоём URL
 if not YOUGILE_TEAM_ID and YOUGILE_COMPANY_ID:
-    # Берём последний сегмент UUID как team-id (как в твоём URL)
     YOUGILE_TEAM_ID = YOUGILE_COMPANY_ID.split("-")[-1]
 
 if not (MM_URL and MM_BOT_TOKEN and YOUGILE_COMPANY_ID and YOUGILE_API_KEY and BOT_PUBLIC_URL):
-    print("ERROR: some required env vars are missing")
-    # не выходим, чтобы было видно в логах, но всё равно работать не будет
+    print("ERROR: some required env vars are missing (MM_URL / MM_BOT_TOKEN / YOUGILE_* / BOT_PUBLIC_URL)")
+    # Не выходим, чтобы это было видно в логах, но бот работать не будет.
 
-# ---------- HTTP HEADERS ----------
+
+# ---------------------------------------------------------------------------
+#  HTTP-заголовки
+# ---------------------------------------------------------------------------
+
 mm_headers = {
     "Authorization": f"Bearer {MM_BOT_TOKEN}",
     "Content-Type": "application/json",
 }
 
 yg_headers = {
-#    "X-Company-Id": YOUGILE_COMPANY_ID,
-#    "X-Api-Key": YOUGILE_API_KEY,
+    # вариант с X-Company-Id / X-Api-Key оставляем закомментированным — вдруг пригодится
+    # "X-Company-Id": YOUGILE_COMPANY_ID,
+    # "X-Api-Key": YOUGILE_API_KEY,
     "Authorization": f"Bearer {YOUGILE_API_KEY}",
     "Content-Type": "application/json",
 }
 
-# ---------- STATE ----------
-# key: (user_id, root_post_id) -> dict
+
+# ---------------------------------------------------------------------------
+#  Состояние диалогов (по пользователю и корневому посту)
+# ---------------------------------------------------------------------------
+
+# ключ: (user_id, root_post_id) → dict со всеми шагами мастера
 STATE = defaultdict(dict)
 STATE_LOCK = threading.Lock()
 
-# ---------- UTILS ----------
 
 def set_state(user_id, root_post_id, data: dict):
+    """
+    Обновляет состояние мастера для пары (user_id, root_post_id).
+    Заодно проставляет created_at / updated_at.
+    """
     now = time.time()
     with STATE_LOCK:
         s = STATE[(user_id, root_post_id)]
         if "created_at" not in s:
             s["created_at"] = now
-        s.update(data)
+        s.update(data or {})
         s["updated_at"] = now
         return s
 
 
 def get_state(user_id, root_post_id):
+    """Возвращает состояние мастера, если есть."""
     with STATE_LOCK:
         return STATE.get((user_id, root_post_id))
 
 
 def clear_state(user_id, root_post_id):
+    """Удаляет состояние мастера для пары (user_id, root_post_id)."""
     with STATE_LOCK:
         STATE.pop((user_id, root_post_id), None)
 
 
+# ---------------------------------------------------------------------------
+#  Помощники для Mattermost
+# ---------------------------------------------------------------------------
+
 def mm_get_user(user_id):
+    """Получить данные пользователя Mattermost по user_id."""
     url = f"{MM_URL}/api/v4/users/{user_id}"
     r = requests.get(url, headers=mm_headers, timeout=10)
     r.raise_for_status()
@@ -88,6 +140,11 @@ def mm_get_user(user_id):
 
 
 def mm_post(channel_id, message, attachments=None, root_id=None):
+    """
+    Создаёт новый пост в Mattermost.
+    Если указан root_id — пост будет в треде.
+    Если переданы attachments — это интерактивные сообщения (кнопки/селекты).
+    """
     payload = {
         "channel_id": channel_id,
         "message": message,
@@ -104,6 +161,11 @@ def mm_post(channel_id, message, attachments=None, root_id=None):
 
 
 def mm_patch_post(post_id, message=None, attachments=None):
+    """
+    Обновляет существующий пост:
+    - можно поменять текст,
+    - можно убрать/заменить attachments.
+    """
     payload = {"id": post_id}
     if message is not None:
         payload["message"] = message
@@ -117,6 +179,7 @@ def mm_patch_post(post_id, message=None, attachments=None):
 
 
 def decode_mm_post_from_event(data):
+    """Парсит JSON-представление поста из события websocket."""
     post_raw = data.get("data", {}).get("post")
     if not post_raw:
         return None
@@ -124,26 +187,31 @@ def decode_mm_post_from_event(data):
 
 
 def parse_create_command(message: str, bot_username: str):
-    # ожидаем: @yougile_bot создай задачу <название>
+    """
+    Парсит команду вида:
+        @yougile_bot создай задачу <название>
+
+    Возвращает title задачи или None, если формат не подходит.
+    """
     text = message.strip()
-    # убираем упоминание
+    # Убираем упоминание бота
     mention_pattern = rf"@{re.escape(bot_username)}"
     text = re.sub(mention_pattern, "", text, flags=re.IGNORECASE).strip()
 
-    # ищем "создай задачу"
+    # Ищем "создай задачу ..."
     pattern = r"^создай\s+задачу\s+(.+)$"
     m = re.search(pattern, text, flags=re.IGNORECASE)
     if not m:
         return None
-    title = m.group(1).strip()
-    return title
+    return m.group(1).strip()
 
 
-# ---------- YOUGILE API WRAPPERS ----------
-# NB: эндпоинты для boards/columns/users могут отличаться у тебя в доке –
-# их удобно вынести в константы и поправить при необходимости.
+# ---------------------------------------------------------------------------
+#  Обёртки над YouGile API
+# ---------------------------------------------------------------------------
 
 def yg_get_projects():
+    """GET /projects — список проектов."""
     r = requests.get(f"{YOUGILE_BASE_URL}/projects", headers=yg_headers, timeout=10)
     r.raise_for_status()
     data = r.json()
@@ -151,6 +219,7 @@ def yg_get_projects():
 
 
 def yg_get_boards(project_id):
+    """GET /boards?projectId=... — список досок проекта."""
     r = requests.get(
         f"{YOUGILE_BASE_URL}/boards",
         headers=yg_headers,
@@ -163,6 +232,7 @@ def yg_get_boards(project_id):
 
 
 def yg_get_columns(board_id):
+    """GET /columns?boardId=... — список колонок доски."""
     r = requests.get(
         f"{YOUGILE_BASE_URL}/columns",
         headers=yg_headers,
@@ -175,6 +245,7 @@ def yg_get_columns(board_id):
 
 
 def yg_get_project_users(project_id):
+    """GET /users?projectId=... — список пользователей проекта."""
     r = requests.get(
         f"{YOUGILE_BASE_URL}/users",
         headers=yg_headers,
@@ -190,7 +261,9 @@ def yg_get_project_users(project_id):
     print("DEBUG yg_get_project_users unexpected type:", type(data), data)
     return []
 
+
 def yg_get_task(task_id):
+    """GET /tasks/{id} — полная карточка задачи."""
     r = requests.get(
         f"{YOUGILE_BASE_URL}/tasks/{task_id}",
         headers=yg_headers,
@@ -201,7 +274,7 @@ def yg_get_task(task_id):
 
 
 def yg_update_task_description(task_id, new_description):
-    # YouGile обычно обновляет задачу через PUT /tasks/{id}
+    """PUT /tasks/{id} — обновить описание задачи."""
     r = requests.put(
         f"{YOUGILE_BASE_URL}/tasks/{task_id}",
         headers=yg_headers,
@@ -211,7 +284,16 @@ def yg_update_task_description(task_id, new_description):
     r.raise_for_status()
     return r.json()
 
+
 def yg_create_task(title, column_id, description="", assignee_id=None, deadline=None):
+    """
+    POST /tasks — создать задачу в YouGile.
+    - title: название
+    - column_id: колонка
+    - description: описание
+    - assignee_id: id исполнителя (опционально)
+    - deadline: date или None
+    """
     body = {
         "title": title,
         "columnId": column_id,
@@ -224,8 +306,7 @@ def yg_create_task(title, column_id, description="", assignee_id=None, deadline=
 
     # дедлайн в формате YouGile
     if deadline:
-        # deadline у нас date, превращаем в 00:00 локального дня и далее в миллисекунды
-        # Полдень по UTC, чтобы дата не сдвигалась
+        # deadline у нас date, превращаем в полдень по UTC, чтобы дата не сдвигалась
         dt_utc_noon = datetime(
             deadline.year,
             deadline.month,
@@ -236,7 +317,6 @@ def yg_create_task(title, column_id, description="", assignee_id=None, deadline=
         ms = int(dt_utc_noon.timestamp() * 1000)
         body["deadline"] = {
             "deadline": ms,
-            # "startDate": ms,          <-- Убрал, так как не нужно
             "withTime": False,
         }
 
@@ -246,18 +326,23 @@ def yg_create_task(title, column_id, description="", assignee_id=None, deadline=
         json=body,
         timeout=10,
     )
-
-    # на время отладки можно раскомментировать:
+    # при отладке можно включить:
     # print("YG create task status:", r.status_code, "body:", r.text)
-
     r.raise_for_status()
     return r.json()
 
-# ---------- DUE DATE UTILS ----------
+
+# ---------------------------------------------------------------------------
+#  Дедлайны
+# ---------------------------------------------------------------------------
 
 def calc_deadline(choice: str) -> date:
+    """
+    Преобразует строковый выбор дедлайна в дату:
+    today / tomorrow / day_after_tomorrow / week / month.
+    """
     today = date.today()
-    c = choice.lower()
+    c = (choice or "").lower()
     if c == "today":
         return today
     if c == "tomorrow":
@@ -272,8 +357,14 @@ def calc_deadline(choice: str) -> date:
     return today
 
 
-# ---------- BUILD ATTACHMENTS FOR STEPS ----------
+# ---------------------------------------------------------------------------
+#  Построение интерактивных сообщений (attachments) для шагов мастера
+# ---------------------------------------------------------------------------
+
 def add_cancel_action(actions, task_title, root_post_id, user_id):
+    """
+    Добавляет красную кнопку "Отменить" в конец списка actions.
+    """
     actions.append({
         "id": "cancel",
         "name": "Отменить",
@@ -291,11 +382,13 @@ def add_cancel_action(actions, task_title, root_post_id, user_id):
     })
     return actions
 
+
 def build_project_buttons(task_title, projects, user_id, root_post_id):
+    """Кнопки выбора проекта."""
     actions = []
     for idx, p in enumerate(projects):
         actions.append({
-            "id": f"project{idx}",  # БЕЗ _ и -
+            "id": f"project{idx}",  # важно: без дефисов и подчёркиваний
             "name": p.get("title", "Без имени"),
             "type": "button",
             "integration": {
@@ -304,7 +397,7 @@ def build_project_buttons(task_title, projects, user_id, root_post_id):
                     "step": "CHOOSE_PROJECT",
                     "task_title": task_title,
                     "project_id": p["id"],
-                    "project_title": p.get("title", "Без имени"),  # понадобится для текста
+                    "project_title": p.get("title", "Без имени"),
                     "root_post_id": root_post_id,
                     "user_id": user_id,
                 }
@@ -318,10 +411,11 @@ def build_project_buttons(task_title, projects, user_id, root_post_id):
 
 
 def build_board_buttons(task_title, project_id, boards, user_id, root_post_id):
+    """Кнопки выбора доски."""
     actions = []
     for idx, b in enumerate(boards):
         actions.append({
-            "id": f"board{idx}",  # вместо board_{b['id']}
+            "id": f"board{idx}",
             "name": b.get("title", "Без имени"),
             "type": "button",
             "integration": {
@@ -345,10 +439,11 @@ def build_board_buttons(task_title, project_id, boards, user_id, root_post_id):
 
 
 def build_column_buttons(task_title, project_id, board_id, columns, user_id, root_post_id):
+    """Кнопки выбора колонки."""
     actions = []
     for idx, c in enumerate(columns):
         actions.append({
-            "id": f"column{idx}",  # вместо column_{c['id']}
+            "id": f"column{idx}",
             "name": c.get("title", "Без имени"),
             "type": "button",
             "integration": {
@@ -373,6 +468,7 @@ def build_column_buttons(task_title, project_id, board_id, columns, user_id, roo
 
 
 def build_assignee_select(task_title, project_id, board_id, column_id, users, user_id, root_post_id):
+    """Селект выбора исполнителя + кнопка отмены."""
     options = []
     for u in users:
         full_name = u.get("realName", "") or u.get("email", "Без имени")
@@ -380,32 +476,35 @@ def build_assignee_select(task_title, project_id, board_id, column_id, users, us
             "text": full_name,
             "value": u["id"]
         })
+
+    base_action = {
+        "id": "assigneeSelect",
+        "name": "Выберите исполнителя",
+        "type": "select",
+        "options": options,
+        "integration": {
+            "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
+            "context": {
+                "step": "CHOOSE_ASSIGNEE",
+                "task_title": task_title,
+                "project_id": project_id,
+                "board_id": board_id,
+                "column_id": column_id,
+                "root_post_id": root_post_id,
+                "user_id": user_id,
+            }
+        }
+    }
+
     return [{
         "text": "Исполнитель:",
-        "actions": add_cancel_action([
-            {
-                "id": "assigneeSelect",  # раньше assignee_select
-                "name": "Выберите исполнителя",
-                "type": "select",
-                "options": options,
-                "integration": {
-                    "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
-                    "context": {
-                        "step": "CHOOSE_ASSIGNEE",
-                        "task_title": task_title,
-                        "project_id": project_id,
-                        "board_id": board_id,
-                        "column_id": column_id,
-                        "root_post_id": root_post_id,
-                        "user_id": user_id,
-                    }
-                }
-            }
-        ], task_title, root_post_id, user_id)
+        "actions": add_cancel_action([base_action], task_title, root_post_id, user_id)
     }]
 
 
 def build_deadline_buttons(task_title, meta, user_id, root_post_id):
+    """Кнопки выбора дедлайна."""
+
     def act(id_, name, key):
         ctx = {
             "step": "CHOOSE_DEADLINE",
@@ -416,7 +515,7 @@ def build_deadline_buttons(task_title, meta, user_id, root_post_id):
         }
         ctx.update(meta)
         return {
-            "id": id_,      # здесь ids будут без _
+            "id": id_,
             "name": name,
             "type": "button",
             "integration": {
@@ -444,6 +543,7 @@ def build_deadline_buttons(task_title, meta, user_id, root_post_id):
 
 
 def build_finish_buttons(task_title, task_url, user_id, root_post_id, meta):
+    """Кнопка 'Завершить' после создания задачи."""
     actions = [
         {
             "id": "finish",
@@ -463,25 +563,36 @@ def build_finish_buttons(task_title, task_url, user_id, root_post_id, meta):
         }
     ]
     return [{
-        "text": f"Задача создана. Ссылка: {task_url}\n"
-                f"Можете написать дополнительный комментарий в этом треде, "
-                f"а затем нажать \"Завершить\".",
+        "text": (
+            f"Задача создана. Ссылка: {task_url}\n"
+            f"Можете написать дополнительный комментарий в этом треде, "
+            f'а затем нажать "Завершить".'
+        ),
         "actions": actions
     }]
 
 
-# ---------- FLASK APP ----------
+# ---------------------------------------------------------------------------
+#  Flask-приложение (webhook для интерактивных действий Mattermost)
+# ---------------------------------------------------------------------------
 
 app = Flask(__name__)
 
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
+    """Простой healthcheck."""
     return "ok", 200
 
 
 @app.route("/mattermost/actions", methods=["POST"])
 def mm_actions():
+    """
+    Обработчик интерактивных действий Mattermost:
+    - выбор проекта / доски / колонки / исполнителя / дедлайна
+    - отмена
+    - ручное завершение диалога
+    """
     data = request.get_json(force=True, silent=True) or {}
     context = data.get("context", {})
     step = context.get("step")
@@ -490,6 +601,7 @@ def mm_actions():
     post_id = data.get("post_id")
     channel_id = data.get("channel_id")
 
+    # Без этих полей корректно обработать событие не получится — тихо игнорируем
     if not (step and user_id and root_post_id and post_id and channel_id):
         return "", 200
 
@@ -506,13 +618,13 @@ def mm_actions():
                 "step": "CHOOSE_PROJECT",
                 "task_title": task_title,
                 "project_id": project_id,
-                "project_title": project_title,   # <-- ДОБАВИЛИ
+                "project_title": project_title,
                 "channel_id": channel_id,
             })
 
             boards = yg_get_boards(project_id)
 
-            # превращаем старое сообщение в "фикс выбора" без кнопок
+            # Превращаем текущее сообщение в "фикс выбора" без кнопок
             mm_patch_post(
                 post_id,
                 message=f'Проект для задачи "{task_title}": {project_title}',
@@ -528,7 +640,7 @@ def mm_actions():
                 return "", 200
 
             if len(boards) <= 1:
-                # одна доска — сразу идём к колонкам
+                # Если в проекте одна доска — сразу идём к выбору колонки
                 board = boards[0]
                 board_id = board["id"]
                 board_title = board.get("title", "без названия")
@@ -552,6 +664,7 @@ def mm_actions():
                     "post_ids": state.get("post_ids", []) + [resp["id"]]
                 })
             else:
+                # Иначе сначала спрашиваем доску
                 attachments = build_board_buttons(
                     task_title, project_id, boards, user_id, root_post_id
                 )
@@ -583,7 +696,7 @@ def mm_actions():
                 task_title, project_id, board_id, columns, user_id, root_post_id
             )
 
-            # фиксируем выбор доски в текущем сообщении
+            # Фиксируем выбор доски
             mm_patch_post(
                 post_id,
                 message=f'Доска для задачи "{task_title}": {board_title}',
@@ -650,13 +763,13 @@ def mm_actions():
                 "assignee_id": assignee_id,
             })
 
-            # значение по умолчанию
+            # Значение по умолчанию — id
             assignee_name = assignee_id
 
-            # вытаскиваем project_id из state
+            # Вытаскиваем project_id из state
             project_id = state.get("project_id") or context.get("project_id")
 
-            # пробуем найти имя исполнителя
+            # Пытаемся найти читабельное имя исполнителя
             try:
                 users = yg_get_project_users(project_id)
                 for u in users:
@@ -665,9 +778,8 @@ def mm_actions():
                         break
             except Exception as e:
                 print("Error fetching project users:", e)
-                
-            # теперь сохраняем и имя исполнителя в state,
-            # чтобы FINISH мог корректно вывести его
+
+            # Сохраняем имя исполнителя в состоянии (для финального резюме)
             state = set_state(user_id, root_post_id, {
                 "assignee_name": assignee_name,
             })
@@ -706,6 +818,7 @@ def mm_actions():
             })
 
             if deadline_choice == "custom":
+                # Ждём ввода даты в тред
                 mm_patch_post(
                     post_id,
                     message=(
@@ -719,6 +832,7 @@ def mm_actions():
                 state = set_state(user_id, root_post_id, {"deadline": None})
                 create_task_and_update_post(task_title, state, user_id, post_id)
             else:
+                # Стандартные варианты: сегодня / завтра / ...
                 deadline_date = calc_deadline(deadline_choice)
                 state = set_state(user_id, root_post_id, {"deadline": deadline_date})
                 create_task_and_update_post(task_title, state, user_id, post_id)
@@ -729,7 +843,7 @@ def mm_actions():
             channel_id_state = state.get("channel_id", channel_id)
             post_ids = state.get("post_ids", [])
 
-            # удаляем все посты бота в этом треде
+            # Удаляем все посты бота в этом треде
             for pid in post_ids:
                 try:
                     requests.delete(
@@ -753,7 +867,7 @@ def mm_actions():
 
             return "", 200
 
-        # ---------- ЗАВЕРШЕНИЕ ДИАЛОГА ----------
+        # ---------- РУЧНОЕ ЗАВЕРШЕНИЕ ДИАЛОГА ----------
         elif step == "FINISH":
             st = get_state(user_id, root_post_id) or {}
 
@@ -762,7 +876,6 @@ def mm_actions():
             assignee_name = st.get("assignee_name", "не указан")
             deadline_str = st.get("deadline_str", "без дедлайна")
             task_url = st.get("task_url", "")
-
             channel_id_state = st.get("channel_id", channel_id)
 
             summary = (
@@ -773,20 +886,20 @@ def mm_actions():
             if task_url:
                 summary += f"\nСсылка: {task_url}"
 
-            # сообщение в треде
+            # Сообщение в треде
             mm_post(
                 channel_id_state,
                 message=summary,
                 root_id=root_post_id
             )
 
-            # сообщение в сам канал (без треда)
+            # И дублируем в канал (отдельным постом)
             mm_post(
                 channel_id_state,
                 message=summary
             )
 
-            # optionally – подчистим сообщение с кнопкой
+            # Подчищаем сообщение с кнопкой
             mm_patch_post(
                 post_id,
                 message=f'Диалог по задаче "{task_title}" завершён.',
@@ -804,7 +917,17 @@ def mm_actions():
 
     return "", 200
 
+
+# ---------------------------------------------------------------------------
+#  Создание задачи в YouGile + обновление поста с кнопкой "Завершить"
+# ---------------------------------------------------------------------------
+
 def create_task_and_update_post(task_title, state, user_id, post_id):
+    """
+    Создаёт задачу в YouGile на основе state и обновляет сообщение
+    в Mattermost (там, где были кнопки дедлайна) на "✅ Задача создана".
+    Также записывает всё нужное для финального резюме (FINISH / автозавершение).
+    """
     # Автор в описании — FirstName LastName из Mattermost
     mm_user = mm_get_user(user_id)
     first_name = mm_user.get("first_name", "").strip()
@@ -828,7 +951,7 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
     )
     task_id = task.get("id")
 
-    # подтягиваем полную задачу, чтобы получить idTaskProject
+    # пробуем вытащить idTaskProject / idTaskCommon
     task_project_id = task.get("idTaskProject") or task.get("idTaskCommon")
     try:
         if task_id and not task_project_id:
@@ -837,7 +960,7 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
     except Exception as e:
         print("Error fetching full YouGile task:", e)
 
-    # красивый URL
+    # "Красивый" URL
     project_title = state.get("project_title")
     project_slug = slugify_title(project_title) if project_title else ""
     team_id = YOUGILE_TEAM_ID or YOUGILE_COMPANY_ID
@@ -860,25 +983,31 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
     }
     attachments = build_finish_buttons(task_title, task_url, user_id, state.get("root_post_id"), meta)
 
+    # Обновляем пост с выбором дедлайна
     mm_patch_post(
         post_id,
         message=(
             f'✅ Задача "{task_title}" создана.\n'
-            f'Ссылка: {task_url}\n'
+            f"Ссылка: {task_url}\n"
             f'Можете оставить дополнительный комментарий в треде, затем нажмите "Завершить".'
         ),
         attachments=attachments
     )
 
-    # сохраняем всё нужное для финального резюме
+    # Сохраняем всё нужное, чтобы потом красиво завершить диалог
     set_state(user_id, state.get("root_post_id"), {
         "step": "OPTIONAL_ATTACH",
         "yougile_task_id": task_id,
         "task_url": task_url,
         "deadline_str": deadline_str,
     })
-    
+
+
 def auto_finish_dialog(user_id, root_post_id):
+    """
+    Автозавершение диалога, если пользователь не нажал "Завершить"
+    в течение AUTO_FINISH_TIMEOUT_MINUTES.
+    """
     st = get_state(user_id, root_post_id) or {}
     if not st:
         return
@@ -902,14 +1031,14 @@ def auto_finish_dialog(user_id, root_post_id):
     if task_url:
         summary += f"\nСсылка: {task_url}"
 
-    # сообщение в тред
+    # Сообщение в тред
     mm_post(
         channel_id_state,
         message=summary,
         root_id=root_post_id
     )
 
-    # сообщение в канал
+    # И дублируем в канал с пометкой "Автозавершение"
     mm_post(
         channel_id_state,
         message=f"(Автозавершение) {summary}"
@@ -918,9 +1047,12 @@ def auto_finish_dialog(user_id, root_post_id):
     clear_state(user_id, root_post_id)
 
 
-# ---------- WEBSOCKET BOT ----------
+# ---------------------------------------------------------------------------
+#  WebSocket-бот Mattermost
+# ---------------------------------------------------------------------------
 
 def run_ws_bot():
+    """Подключение к Mattermost WebSocket и обработка событий posted."""
     ws_url = MM_URL.replace("https", "wss").replace("http", "ws") + "/api/v4/websocket"
     seq = 1
 
@@ -928,6 +1060,8 @@ def run_ws_bot():
         try:
             print(f"Connecting to Mattermost WS {ws_url}")
             ws = create_connection(ws_url)
+
+            # Аутентифицируемся токеном бота
             auth_msg = {
                 "seq": seq,
                 "action": "authentication_challenge",
@@ -945,6 +1079,7 @@ def run_ws_bot():
                     continue
                 data = json.loads(msg)
 
+                # Нас интересуют только события "posted"
                 if data.get("event") != "posted":
                     continue
 
@@ -957,16 +1092,16 @@ def run_ws_bot():
                 message = post.get("message", "")
                 root_id = post.get("root_id") or post.get("id")
 
-                # 1) если это новый старт: @yougile_bot ...
+                # ---------- 1) Старт диалога: упоминание бота ----------
                 if f"@{MM_BOT_USERNAME}" in message.lower():
                     title = parse_create_command(message, MM_BOT_USERNAME)
 
-                    # если команда непонятна — показываем подсказку
+                    # Если команда непонятна — показываем хелп
                     if not title:
                         help_text = (
                             ":huh: Привет!\n"
                             "Я пока глупенький и умею работать только со следующей командой:\n"
-                            f"- `создай задачу <название задачи>`\n\n"
+                            "- `создай задачу <название задачи>`\n\n"
                             "Попробуйте ещё раз, пожалуйста, используя команду выше.\n"
                             "Спасибо! :thanks:"
                         )
@@ -977,7 +1112,7 @@ def run_ws_bot():
                         )
                         continue
 
-                    # если команда корректная — запускаем мастер создания задачи
+                    # Команда корректна — запускаем мастер
                     projects = yg_get_projects()
                     with STATE_LOCK:
                         STATE[(user_id, root_id)] = {
@@ -985,7 +1120,7 @@ def run_ws_bot():
                             "task_title": title,
                             "root_post_id": root_id,
                             "channel_id": channel_id,
-                            "post_ids": [],   # список постов бота
+                            "post_ids": [],   # список постов бота в треде
                         }
 
                     attachments = build_project_buttons(title, projects, user_id, root_id)
@@ -1000,7 +1135,7 @@ def run_ws_bot():
                     })
                     continue
 
-                # 2) если мы ждём кастомную дату дедлайна
+                # ---------- 2) Ожидание кастомной даты дедлайна ----------
                 st = get_state(user_id, root_id)
                 if st and st.get("step") == "CHOOSE_DEADLINE" and st.get("deadline_choice") == "custom":
                     text = message.strip()
@@ -1009,7 +1144,6 @@ def run_ws_bot():
                             # Ждём формат YYYY-MM-DD
                             d = datetime.strptime(text, "%Y-%m-%d").date()
                         except ValueError:
-                            # не похоже на дату — скажем об этом и ждём дальше
                             mm_post(
                                 channel_id,
                                 message=(
@@ -1020,20 +1154,19 @@ def run_ws_bot():
                             )
                             continue
 
-                        # дата распарсилась — сохраняем дедлайн
+                        # Дата распарсилась — сохраняем дедлайн
                         st = set_state(user_id, root_id, {"deadline": d})
                         task_title = st.get("task_title", "Без названия")
 
-                        # берём последний пост бота в этом диалоге
+                        # Берём последний пост бота в этом диалоге
                         post_ids = st.get("post_ids") or []
                         target_post_id = post_ids[-1] if post_ids else None
 
                         if target_post_id:
-                            # обновляем последний бот-пост (не пост пользователя!)
+                            # Обновляем последний бот-пост (тот, где были кнопки дедлайна)
                             create_task_and_update_post(task_title, st, user_id, target_post_id)
                         else:
-                            # на всякий случай — если по какой-то причине нет post_ids,
-                            # просто создаём новый пост с результатом
+                            # fallback — если по какой-то причине нет post_ids
                             mm_post(
                                 channel_id,
                                 message=f'✅ Задача "{task_title}" создана (кастомный дедлайн).',
@@ -1041,7 +1174,7 @@ def run_ws_bot():
                             )
                         continue
 
-                # 3) если мы на шаге OPTIONAL_ATTACH и пользователь пишет что-то в треде
+                # ---------- 3) Дополнительные комментарии после создания задачи ----------
                 st = get_state(user_id, root_id)
                 if st and st.get("step") == "OPTIONAL_ATTACH":
                     task_id = st.get("yougile_task_id")
@@ -1049,8 +1182,8 @@ def run_ws_bot():
                         try:
                             task = yg_get_task(task_id)
                             old_desc = task.get("description") or ""
-                            ts = datetime.now().strftime("%d.%m.%Y %H:%M")
-                            # если описания нет — просто пишем текст;
+                            ts = datetime.now().strftime("%d.%m.%Y %H:%М")
+                            # Если описания нет — просто пишем текст;
                             # если есть — вставляем два <br> перед блоком
                             if old_desc:
                                 new_desc = (
@@ -1060,10 +1193,11 @@ def run_ws_bot():
                             else:
                                 new_desc = f"Дополнено {ts}:<br>{message}"
                             yg_update_task_description(task_id, new_desc)
-                            # помечаем, что последнее действие было только что
+                            # Обновляем updated_at для авто-завершения
                             set_state(user_id, root_id, {})
                         except Exception as e:
                             print("Error updating description in YouGile:", e)
+
         except WebSocketConnectionClosedException:
             print("WS closed, reconnecting in 3s...")
             time.sleep(3)
@@ -1073,23 +1207,34 @@ def run_ws_bot():
 
 
 def start_ws_thread():
+    """Стартуем отдельный поток для WebSocket-бота."""
     t = threading.Thread(target=run_ws_bot, daemon=True)
     t.start()
-    
+
+
+# ---------------------------------------------------------------------------
+#  Авто-уборка зависших диалогов (автозавершение)
+# ---------------------------------------------------------------------------
+
 def auto_cleanup_loop():
+    """
+    Раз в минуту просматривает STATE и автозавершает диалоги,
+    которые давно в состоянии OPTIONAL_ATTACH.
+    """
     while True:
         try:
             now = time.time()
             with STATE_LOCK:
                 items = list(STATE.items())
             for (user_id, root_post_id), st in items:
-                # интересуют только стадии, где задача уже создана,
+                # Интересуют только стадии, где задача уже создана,
                 # но диалог формально не закрыт
                 if st.get("step") != "OPTIONAL_ATTACH":
                     continue
                 updated_at = st.get("updated_at") or st.get("created_at")
                 if not updated_at:
                     continue
+                # Проверяем таймаут
                 if now - updated_at > AUTO_FINISH_TIMEOUT_MINUTES * 60:
                     print(f"Auto-finishing dialog for user={user_id}, root={root_post_id}")
                     try:
@@ -1102,11 +1247,14 @@ def auto_cleanup_loop():
 
 
 def start_cleanup_thread():
+    """Стартуем отдельный поток авто-уборки."""
     t = threading.Thread(target=auto_cleanup_loop, daemon=True)
     t.start()
 
 
-# ---------- MAIN ----------
+# ---------------------------------------------------------------------------
+#  MAIN
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     start_ws_thread()
