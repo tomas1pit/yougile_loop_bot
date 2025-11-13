@@ -171,6 +171,26 @@ def yg_get_project_users(project_id):
     print("DEBUG yg_get_project_users unexpected type:", type(data), data)
     return []
 
+def yg_get_task(task_id):
+    r = requests.get(
+        f"{YOUGILE_BASE_URL}/tasks/{task_id}",
+        headers=yg_headers,
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def yg_update_task_description(task_id, new_description):
+    # YouGile обычно обновляет задачу через PUT /tasks/{id}
+    r = requests.put(
+        f"{YOUGILE_BASE_URL}/tasks/{task_id}",
+        headers=yg_headers,
+        json={"description": new_description},
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
 
 def yg_create_task(title, column_id, description="", assignee_id=None, deadline=None):
     body = {
@@ -190,7 +210,7 @@ def yg_create_task(title, column_id, description="", assignee_id=None, deadline=
         ms = int(dt.timestamp() * 1000)
         body["deadline"] = {
             "deadline": ms,
-            "startDate": ms,
+            # "startDate": ms,          <-- Убрал, так как не нужно
             "withTime": False,
         }
 
@@ -206,19 +226,6 @@ def yg_create_task(title, column_id, description="", assignee_id=None, deadline=
 
     r.raise_for_status()
     return r.json()
-
-
-def yg_add_comment(task_id, text):
-    # зависит от реального API YouGile, проверить в доке
-    r = requests.post(
-        f"{YOUGILE_BASE_URL}/tasks/{task_id}/comments",
-        headers=yg_headers,
-        json={"text": text},
-        timeout=10,
-    )
-    r.raise_for_status()
-    return r.json()
-
 
 # ---------- DUE DATE UTILS ----------
 
@@ -424,7 +431,7 @@ def build_finish_buttons(task_title, task_url, user_id, root_post_id, meta):
     ]
     return [{
         "text": f"Задача создана. Ссылка: {task_url}\n"
-                f"Можете прикрепить файлы или написать комментарий в этом треде, "
+                f"Можете написать дополнительный комментарий в этом треде, "
                 f"а затем нажать \"Завершить\".",
         "actions": actions
     }]
@@ -727,7 +734,7 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
     assignee_id = state.get("assignee_id")
     deadline = state.get("deadline")
 
-    description = f"Создано из Mattermost пользователем {full_name} (@{username})"
+    description = f"Создано из Loop пользователем {full_name} (@{username})"
 
     task = yg_create_task(task_title, column_id, description=description, assignee_id=assignee_id, deadline=deadline)
     task_id = task.get("id")
@@ -741,7 +748,7 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
     mm_patch_post(
         post_id,
         message=f'✅ Задача "{task_title}" создана.\nСсылка: {task_url}\n'
-                f'Можете прикрепить файлы или оставить комментарий в треде, затем нажмите "Завершить".',
+                f'Можете оставить дополнительный комментарий в треде, затем нажмите \"Завершить\".',
         attachments=attachments
     )
 
@@ -819,18 +826,47 @@ def run_ws_bot():
                     })
                     continue
 
-                # 2) если мы на шаге OPTIONAL_ATTACH и пользователь пишет что-то в треде
+                # 2) если мы ждём кастомную дату дедлайна
+                st = get_state(user_id, root_id)
+                if st and st.get("step") == "CHOOSE_DEADLINE" and st.get("deadline_choice") == "custom":
+                    text = message.strip()
+                    if text:
+                        try:
+                            # Ждём формат YYYY-MM-DD
+                            d = datetime.strptime(text, "%Y-%m-%d").date()
+                        except ValueError:
+                            # не похоже на дату — скажем об этом и ждём дальше
+                            mm_post(
+                                channel_id,
+                                message=(
+                                    f'Не удалось разобрать дату "{text}". '
+                                    f'Используйте формат YYYY-MM-DD, например 2025-11-13.'
+                                ),
+                                root_id=root_id
+                            )
+                            continue
+
+                        # дата распарсилась — сохраняем дедлайн и создаём задачу
+                        st = set_state(user_id, root_id, {"deadline": d})
+                        task_title = st.get("task_title", "Без названия")
+                        # патчим сообщение пользователя с датой на "задача создана"
+                        create_task_and_update_post(task_title, st, user_id, post.get("id"))
+                        continue
+
+                # 3) если мы на шаге OPTIONAL_ATTACH и пользователь пишет что-то в треде
                 st = get_state(user_id, root_id)
                 if st and st.get("step") == "OPTIONAL_ATTACH":
                     task_id = st.get("yougile_task_id")
                     if message.strip():
                         try:
-                            yg_add_comment(task_id, message)
+                            task = yg_get_task(task_id)
+                            old_desc = task.get("description") or ""
+                            ts = datetime.now().strftime("%d.%m.%Y %H:%M")
+                            addition = f'\n\nДополнено {ts}:\n{message}'
+                            new_desc = (old_desc or "") + addition
+                            yg_update_task_description(task_id, new_desc)
                         except Exception as e:
-                            print("Error adding comment to YouGile:", e)
-                    # TODO: прикрепление файлов можно реализовать отдельно через
-                    # Mattermost /files и YouGile endpoint для файлов задач.
-                    # Пока просто принимаем текст.
+                            print("Error updating description in YouGile:", e)
         except WebSocketConnectionClosedException:
             print("WS closed, reconnecting in 3s...")
             time.sleep(3)
