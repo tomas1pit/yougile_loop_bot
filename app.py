@@ -222,7 +222,7 @@ def build_project_buttons(task_title, projects, user_id, root_post_id):
     actions = []
     for p in projects:
         actions.append({
-            "id": f"project_{p['id']}",
+            "id": "project",  # раньше было project_{p['id']}
             "name": p.get("title", "Без имени"),
             "type": "button",
             "integration": {
@@ -246,7 +246,7 @@ def build_board_buttons(task_title, project_id, boards, user_id, root_post_id):
     actions = []
     for b in boards:
         actions.append({
-            "id": f"board_{b['id']}",
+            "id": "board",  # раньше board_{b['id']}
             "name": b.get("title", "Без имени"),
             "type": "button",
             "integration": {
@@ -271,7 +271,7 @@ def build_column_buttons(task_title, project_id, board_id, columns, user_id, roo
     actions = []
     for c in columns:
         actions.append({
-            "id": f"col_{c['id']}",
+            "id": "column",  # раньше col_{c['id']}
             "name": c.get("title", "Без имени"),
             "type": "button",
             "integration": {
@@ -305,7 +305,7 @@ def build_assignee_select(task_title, project_id, board_id, column_id, users, us
         "text": "Исполнитель:",
         "actions": [
             {
-                "id": "assignee_select",
+                "id": "assigneeSelect",  # раньше assignee_select
                 "name": "Выберите исполнителя",
                 "type": "select",
                 "options": options,
@@ -337,7 +337,7 @@ def build_deadline_buttons(task_title, meta, user_id, root_post_id):
         }
         ctx.update(meta)
         return {
-            "id": id_,
+            "id": id_,      # здесь ids будут без _
             "name": name,
             "type": "button",
             "integration": {
