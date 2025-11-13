@@ -231,6 +231,7 @@ def build_project_buttons(task_title, projects, user_id, root_post_id):
                     "step": "CHOOSE_PROJECT",
                     "task_title": task_title,
                     "project_id": p["id"],
+                    "project_title": p.get("title", "Без имени"),  # <--- ДОБАВИЛИ
                     "root_post_id": root_post_id,
                     "user_id": user_id,
                 }
@@ -415,71 +416,125 @@ def mm_actions():
     try:
         if step == "CHOOSE_PROJECT":
             project_id = context["project_id"]
+            project_title = context.get("project_title", "без названия")
             state = set_state(user_id, root_post_id, {
                 "step": "CHOOSE_PROJECT",
                 "task_title": task_title,
                 "project_id": project_id,
                 "channel_id": channel_id,
             })
+
             boards = yg_get_boards(project_id)
+
+            # сначала "замораживаем" старый пост без кнопок
+            mm_patch_post(
+                post_id,
+                message=f'Проект для задачи "{task_title}": {project_title}',
+                attachments=[]
+            )
+
+            if not boards:
+                # вообще нет досок
+                mm_post(
+                    channel_id,
+                    message=f'В проекте "{project_title}" нет досок, задачу создать нельзя.',
+                    root_id=root_post_id
+                )
+                return "", 200
+
             if len(boards) <= 1:
                 # если одна доска – сразу к колонкам
                 board = boards[0]
                 board_id = board["id"]
                 state = set_state(user_id, root_post_id, {"board_id": board_id})
+
                 columns = yg_get_columns(board_id)
-                attachments = build_column_buttons(task_title, project_id, board_id, columns, user_id, root_post_id)
-                mm_patch_post(
-                    post_id,
+                attachments = build_column_buttons(
+                    task_title, project_id, board_id, columns, user_id, root_post_id
+                )
+
+                # новый пост с выбором колонки
+                mm_post(
+                    channel_id,
                     message=f'Выберите колонку для задачи "{task_title}"',
-                    attachments=attachments
+                    attachments=attachments,
+                    root_id=root_post_id
                 )
             else:
-                attachments = build_board_buttons(task_title, project_id, boards, user_id, root_post_id)
-                mm_patch_post(
-                    post_id,
+                # несколько досок – задаём вопрос
+                attachments = build_board_buttons(
+                    task_title, project_id, boards, user_id, root_post_id
+                )
+                mm_post(
+                    channel_id,
                     message=f'Выберите доску для задачи "{task_title}"',
-                    attachments=attachments
+                    attachments=attachments,
+                    root_id=root_post_id
                 )
 
         elif step == "CHOOSE_BOARD":
             project_id = context["project_id"]
             board_id = context["board_id"]
+
             state = set_state(user_id, root_post_id, {
                 "step": "CHOOSE_BOARD",
                 "project_id": project_id,
                 "board_id": board_id,
             })
+
             columns = yg_get_columns(board_id)
-            attachments = build_column_buttons(task_title, project_id, board_id, columns, user_id, root_post_id)
+            attachments = build_column_buttons(
+                task_title, project_id, board_id, columns, user_id, root_post_id
+            )
+
+            # затираем кнопки выбора доски
             mm_patch_post(
                 post_id,
+                message=f'Доска для задачи "{task_title}" выбрана.',
+                attachments=[]
+            )
+
+            # новый пост с выбором колонки
+            mm_post(
+                channel_id,
                 message=f'Выберите колонку для задачи "{task_title}"',
-                attachments=attachments
+                attachments=attachments,
+                root_id=root_post_id
             )
 
         elif step == "CHOOSE_COLUMN":
             project_id = context["project_id"]
             board_id = context["board_id"]
             column_id = context["column_id"]
+
             state = set_state(user_id, root_post_id, {
                 "step": "CHOOSE_COLUMN",
                 "project_id": project_id,
                 "board_id": board_id,
                 "column_id": column_id,
             })
+
             users = yg_get_board_users(board_id)
             attachments = build_assignee_select(
                 task_title, project_id, board_id, column_id, users, user_id, root_post_id
             )
+
+            # старый пост — фиксируем, что колонка выбрана
             mm_patch_post(
                 post_id,
+                message=f'Колонка для задачи "{task_title}" выбрана.',
+                attachments=[]
+            )
+
+            # новый пост с выбором ответственного
+            mm_post(
+                channel_id,
                 message=f'Кого назначить ответственным за задачу "{task_title}"?',
-                attachments=attachments
+                attachments=attachments,
+                root_id=root_post_id
             )
 
         elif step == "CHOOSE_ASSIGNEE":
-            # выбранное значение лежит в data["data"]["selected_option"] / "value"
             selected = (data.get("context") or {}).get("selected_option") or (data.get("data") or {}).get("selected_option")
             if isinstance(selected, dict):
                 assignee_id = selected.get("value")
@@ -500,10 +555,20 @@ def mm_actions():
                 "assignee_id": assignee_id,
             }
             attachments = build_deadline_buttons(task_title, meta, user_id, root_post_id)
+
+            # затираем select с исполнителем
             mm_patch_post(
                 post_id,
+                message=f'Ответственный для задачи "{task_title}" выбран.',
+                attachments=[]
+            )
+
+            # новый пост с выбором дедлайна
+            mm_post(
+                channel_id,
                 message=f'Какую дату дедлайна поставить для задачи "{task_title}"?',
-                attachments=attachments
+                attachments=attachments,
+                root_id=root_post_id
             )
 
         elif step == "CHOOSE_DEADLINE":
