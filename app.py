@@ -242,7 +242,7 @@ def add_cancel_action(actions, task_title, root_post_id, user_id):
 
 def build_project_buttons(task_title, projects, user_id, root_post_id):
     actions = []
-    for p in projects:
+    for idx, p in enumerate(projects):
         actions.append({
             "id": f"project{idx}",  # БЕЗ _ и -
             "name": p.get("title", "Без имени"),
@@ -268,7 +268,7 @@ def build_project_buttons(task_title, projects, user_id, root_post_id):
 
 def build_board_buttons(task_title, project_id, boards, user_id, root_post_id):
     actions = []
-    for b in boards:
+    for idx, b in enumerate(boards):
         actions.append({
             "id": f"board{idx}",  # вместо board_{b['id']}
             "name": b.get("title", "Без имени"),
@@ -295,7 +295,7 @@ def build_board_buttons(task_title, project_id, boards, user_id, root_post_id):
 
 def build_column_buttons(task_title, project_id, board_id, columns, user_id, root_post_id):
     actions = []
-    for c in columns:
+    for idx, c in enumerate(columns):
         actions.append({
             "id": f"column{idx}",  # вместо column_{c['id']}
             "name": c.get("title", "Без имени"),
