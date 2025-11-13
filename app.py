@@ -634,18 +634,18 @@ def mm_actions():
             if not assignee_id:
                 return "", 200
 
-            # сохраняем исполнителя
             state = set_state(user_id, root_post_id, {
                 "step": "CHOOSE_ASSIGNEE",
                 "assignee_id": assignee_id,
-                "assignee_name": assignee_name,
             })
+
+            # значение по умолчанию
+            assignee_name = assignee_id
 
             # вытаскиваем project_id из state
             project_id = state.get("project_id") or context.get("project_id")
 
-            # берём список пользователей проекта, чтобы найти имя
-            assignee_name = assignee_id
+            # пробуем найти имя исполнителя
             try:
                 users = yg_get_project_users(project_id)
                 for u in users:
@@ -653,7 +653,7 @@ def mm_actions():
                         assignee_name = u.get("realName") or u.get("email") or assignee_id
                         break
             except Exception as e:
-                print("Error fetching project users for assignee name:", e)
+                print("Error fetching project users:", e)
 
             meta = {
                 "project_id": state.get("project_id"),
@@ -663,20 +663,19 @@ def mm_actions():
             }
             attachments = build_deadline_buttons(task_title, meta, user_id, root_post_id)
 
-            # затираем select с исполнителем и показываем, кто выбран
             mm_patch_post(
                 post_id,
                 message=f'Ответственный для задачи "{task_title}": {assignee_name}',
                 attachments=[]
             )
 
-            # новый пост с выбором дедлайна
             resp = mm_post(
                 channel_id,
                 message=f'Какую дату дедлайна поставить для задачи "{task_title}"?',
                 attachments=attachments,
                 root_id=root_post_id
             )
+
             set_state(user_id, root_post_id, {
                 "post_ids": state.get("post_ids", []) + [resp["id"]]
             })
