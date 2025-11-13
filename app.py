@@ -913,12 +913,27 @@ def run_ws_bot():
                 message = post.get("message", "")
                 root_id = post.get("root_id") or post.get("id")
 
-                # 1) если это новый старт: @yougile_bot создай задачу ...
+                # 1) если это новый старт: @yougile_bot ...
                 if f"@{MM_BOT_USERNAME}" in message.lower():
                     title = parse_create_command(message, MM_BOT_USERNAME)
+
+                    # если команда непонятна — показываем подсказку
                     if not title:
+                        help_text = (
+                            ":huh: Привет!\n"
+                            "Я пока глупенький и умею работать только со следующей командой:\n"
+                            f"- `@{MM_BOT_USERNAME} создай задачу <название задачи>`\n\n"
+                            "Попробуйте ещё раз, пожалуйста, используя команду выше.\n"
+                            "Спасибо! :thanks:"
+                        )
+                        mm_post(
+                            channel_id,
+                            message=help_text,
+                            root_id=root_id
+                        )
                         continue
 
+                    # если команда корректная — запускаем мастер создания задачи
                     projects = yg_get_projects()
                     with STATE_LOCK:
                         STATE[(user_id, root_id)] = {
