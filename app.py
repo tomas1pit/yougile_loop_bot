@@ -21,6 +21,7 @@ def slugify_title(title: str) -> str:
     return quote(s)
 
 # ---------- ENV ----------
+AUTO_FINISH_TIMEOUT_MINUTES = int(os.getenv("AUTO_FINISH_TIMEOUT_MINUTES", "5"))
 MM_URL = os.getenv("MM_URL").rstrip("/")
 MM_BOT_TOKEN = os.getenv("MM_BOT_TOKEN")
 MM_BOT_USERNAME = os.getenv("MM_BOT_USERNAME", "yougile_bot").lower()  # без @
@@ -59,9 +60,13 @@ STATE_LOCK = threading.Lock()
 # ---------- UTILS ----------
 
 def set_state(user_id, root_post_id, data: dict):
+    now = time.time()
     with STATE_LOCK:
         s = STATE[(user_id, root_post_id)]
+        if "created_at" not in s:
+            s["created_at"] = now
         s.update(data)
+        s["updated_at"] = now
         return s
 
 
@@ -872,6 +877,45 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
         "task_url": task_url,
         "deadline_str": deadline_str,
     })
+    
+def auto_finish_dialog(user_id, root_post_id):
+    st = get_state(user_id, root_post_id) or {}
+    if not st:
+        return
+
+    task_title = st.get("task_title", "Без названия")
+    project_title = st.get("project_title", "без названия")
+    board_title = st.get("board_title", "без названия")
+    assignee_name = st.get("assignee_name", "не указан")
+    deadline_str = st.get("deadline_str", "без дедлайна")
+    task_url = st.get("task_url", "")
+    channel_id_state = st.get("channel_id")
+
+    if not channel_id_state:
+        return
+
+    summary = (
+        f'Задача "{task_title}" создана в проекте: {project_title}, '
+        f'доска: {board_title}, ответственный: {assignee_name}, '
+        f'дедлайн: {deadline_str}.'
+    )
+    if task_url:
+        summary += f"\nСсылка: {task_url}"
+
+    # сообщение в тред
+    mm_post(
+        channel_id_state,
+        message=summary,
+        root_id=root_post_id
+    )
+
+    # сообщение в канал
+    mm_post(
+        channel_id_state,
+        message=f"(Автозавершение) {summary}"
+    )
+
+    clear_state(user_id, root_post_id)
 
 
 # ---------- WEBSOCKET BOT ----------
@@ -1016,6 +1060,8 @@ def run_ws_bot():
                             else:
                                 new_desc = f"Дополнено {ts}:<br>{message}"
                             yg_update_task_description(task_id, new_desc)
+                            # помечаем, что последнее действие было только что
+                            set_state(user_id, root_id, {})
                         except Exception as e:
                             print("Error updating description in YouGile:", e)
         except WebSocketConnectionClosedException:
@@ -1029,10 +1075,40 @@ def run_ws_bot():
 def start_ws_thread():
     t = threading.Thread(target=run_ws_bot, daemon=True)
     t.start()
+    
+def auto_cleanup_loop():
+    while True:
+        try:
+            now = time.time()
+            with STATE_LOCK:
+                items = list(STATE.items())
+            for (user_id, root_post_id), st in items:
+                # интересуют только стадии, где задача уже создана,
+                # но диалог формально не закрыт
+                if st.get("step") != "OPTIONAL_ATTACH":
+                    continue
+                updated_at = st.get("updated_at") or st.get("created_at")
+                if not updated_at:
+                    continue
+                if now - updated_at > AUTO_FINISH_TIMEOUT_MINUTES * 60:
+                    print(f"Auto-finishing dialog for user={user_id}, root={root_post_id}")
+                    try:
+                        auto_finish_dialog(user_id, root_post_id)
+                    except Exception as e:
+                        print("Error in auto_finish_dialog:", e)
+        except Exception as e:
+            print("Error in auto_cleanup_loop:", e)
+        time.sleep(60)
+
+
+def start_cleanup_thread():
+    t = threading.Thread(target=auto_cleanup_loop, daemon=True)
+    t.start()
 
 
 # ---------- MAIN ----------
 
 if __name__ == "__main__":
     start_ws_thread()
+    start_cleanup_thread()
     app.run(host="0.0.0.0", port=8000)
