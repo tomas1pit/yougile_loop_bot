@@ -31,8 +31,9 @@ mm_headers = {
 }
 
 yg_headers = {
-    "X-Company-Id": YOUGILE_COMPANY_ID,
-    "X-Api-Key": YOUGILE_API_KEY,
+#    "X-Company-Id": YOUGILE_COMPANY_ID,
+#    "X-Api-Key": YOUGILE_API_KEY,
+    "Authorization": f"Bearer {YOUGILE_API_KEY}",
     "Content-Type": "application/json",
 }
 
