@@ -21,10 +21,6 @@ def slugify_title(title: str) -> str:
     return quote(s)
 
 # ---------- ENV ----------
-YOUGILE_TEAM_ID = os.getenv("YOUGILE_TEAM_ID")
-if not YOUGILE_TEAM_ID and YOUGILE_COMPANY_ID:
-    # Берём последний сегмент UUID как team-id (как в твоём URL)
-    YOUGILE_TEAM_ID = YOUGILE_COMPANY_ID.split("-")[-1]
 MM_URL = os.getenv("MM_URL").rstrip("/")
 MM_BOT_TOKEN = os.getenv("MM_BOT_TOKEN")
 MM_BOT_USERNAME = os.getenv("MM_BOT_USERNAME", "yougile_bot").lower()  # без @
@@ -33,6 +29,10 @@ BOT_PUBLIC_URL = os.getenv("BOT_PUBLIC_URL").rstrip("/")
 YOUGILE_COMPANY_ID = os.getenv("YOUGILE_COMPANY_ID")
 YOUGILE_API_KEY = os.getenv("YOUGILE_API_KEY")
 YOUGILE_BASE_URL = os.getenv("YOUGILE_BASE_URL", "https://yougile.com/api-v2").rstrip("/")
+YOUGILE_TEAM_ID = os.getenv("YOUGILE_TEAM_ID")
+if not YOUGILE_TEAM_ID and YOUGILE_COMPANY_ID:
+    # Берём последний сегмент UUID как team-id (как в твоём URL)
+    YOUGILE_TEAM_ID = YOUGILE_COMPANY_ID.split("-")[-1]
 
 if not (MM_URL and MM_BOT_TOKEN and YOUGILE_COMPANY_ID and YOUGILE_API_KEY and BOT_PUBLIC_URL):
     print("ERROR: some required env vars are missing")
