@@ -259,6 +259,10 @@ def calc_deadline(choice: str) -> date:
         return today + timedelta(days=1)
     if c == "day_after_tomorrow":
         return today + timedelta(days=2)
+    if c == "week":
+        return today + timedelta(days=7)
+    if c == "month":
+        return today + timedelta(days=30)
     # fallback: сегодня
     return today
 
@@ -421,6 +425,8 @@ def build_deadline_buttons(task_title, meta, user_id, root_post_id):
         act("dlToday", "Сегодня", "today"),
         act("dlTomorrow", "Завтра", "tomorrow"),
         act("dlDayAfter", "Послезавтра", "day_after_tomorrow"),
+        act("dlWeek", "Через неделю", "week"),
+        act("dlMonth", "Через месяц", "month"),
         act("dlCustom", "Другая дата", "custom"),
     ]
 
@@ -654,6 +660,12 @@ def mm_actions():
                         break
             except Exception as e:
                 print("Error fetching project users:", e)
+                
+            # теперь сохраняем и имя исполнителя в state,
+            # чтобы FINISH мог корректно вывести его
+            state = set_state(user_id, root_post_id, {
+                "assignee_name": assignee_name,
+            })
 
             meta = {
                 "project_id": state.get("project_id"),
