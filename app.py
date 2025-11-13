@@ -155,16 +155,21 @@ def yg_get_columns(board_id):
     return data.get("content", [])
 
 
-def yg_get_board_users(board_id):
+def yg_get_project_users(project_id):
     r = requests.get(
         f"{YOUGILE_BASE_URL}/users",
         headers=yg_headers,
-        params={"boardId": board_id},
+        params={"projectId": project_id},
         timeout=10
     )
     r.raise_for_status()
     data = r.json()
-    return data.get("content", [])
+    if isinstance(data, dict):
+        return data.get("content", [])
+    if isinstance(data, list):
+        return data
+    print("DEBUG yg_get_project_users unexpected type:", type(data), data)
+    return []
 
 
 def yg_create_task(title, column_id, description="", assignee_id=None, deadline=None):
@@ -217,12 +222,29 @@ def calc_deadline(choice: str) -> date:
 
 
 # ---------- BUILD ATTACHMENTS FOR STEPS ----------
+def add_cancel_action(actions, task_title, root_post_id, user_id):
+    actions.append({
+        "id": "cancel",
+        "name": "Отменить",
+        "type": "button",
+        "style": "danger",
+        "integration": {
+            "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
+            "context": {
+                "step": "CANCEL",
+                "task_title": task_title,
+                "root_post_id": root_post_id,
+                "user_id": user_id,
+            }
+        }
+    })
+    return actions
 
 def build_project_buttons(task_title, projects, user_id, root_post_id):
     actions = []
     for p in projects:
         actions.append({
-            "id": "project",  # раньше было project_{p['id']}
+            "id": f"project_{p['id']}",  # уникальный id
             "name": p.get("title", "Без имени"),
             "type": "button",
             "integration": {
@@ -231,12 +253,13 @@ def build_project_buttons(task_title, projects, user_id, root_post_id):
                     "step": "CHOOSE_PROJECT",
                     "task_title": task_title,
                     "project_id": p["id"],
-                    "project_title": p.get("title", "Без имени"),  # <--- ДОБАВИЛИ
+                    "project_title": p.get("title", "Без имени"),  # понадобится для текста
                     "root_post_id": root_post_id,
                     "user_id": user_id,
                 }
             }
         })
+    add_cancel_action(actions, task_title, root_post_id, user_id)
     return [{
         "text": "Проекты:",
         "actions": actions
@@ -247,7 +270,7 @@ def build_board_buttons(task_title, project_id, boards, user_id, root_post_id):
     actions = []
     for b in boards:
         actions.append({
-            "id": "board",  # раньше board_{b['id']}
+            "id": f"board_{b['id']}",  # уникальный
             "name": b.get("title", "Без имени"),
             "type": "button",
             "integration": {
@@ -257,11 +280,13 @@ def build_board_buttons(task_title, project_id, boards, user_id, root_post_id):
                     "task_title": task_title,
                     "project_id": project_id,
                     "board_id": b["id"],
+                    "board_title": b.get("title", "Без имени"),
                     "root_post_id": root_post_id,
                     "user_id": user_id,
                 }
             }
         })
+    add_cancel_action(actions, task_title, root_post_id, user_id)
     return [{
         "text": "Доски:",
         "actions": actions
@@ -272,7 +297,7 @@ def build_column_buttons(task_title, project_id, board_id, columns, user_id, roo
     actions = []
     for c in columns:
         actions.append({
-            "id": "column",  # раньше col_{c['id']}
+            "id": f"column_{c['id']}",
             "name": c.get("title", "Без имени"),
             "type": "button",
             "integration": {
@@ -283,11 +308,13 @@ def build_column_buttons(task_title, project_id, board_id, columns, user_id, roo
                     "project_id": project_id,
                     "board_id": board_id,
                     "column_id": c["id"],
+                    "column_title": c.get("title", "Без имени"),
                     "root_post_id": root_post_id,
                     "user_id": user_id,
                 }
             }
         })
+    add_cancel_action(actions, task_title, root_post_id, user_id)
     return [{
         "text": "Колонки:",
         "actions": actions
@@ -304,7 +331,7 @@ def build_assignee_select(task_title, project_id, board_id, column_id, users, us
         })
     return [{
         "text": "Исполнитель:",
-        "actions": [
+        "actions": add_cancel_action([
             {
                 "id": "assigneeSelect",  # раньше assignee_select
                 "name": "Выберите исполнителя",
@@ -323,7 +350,7 @@ def build_assignee_select(task_title, project_id, board_id, column_id, users, us
                     }
                 }
             }
-        ]
+        ], task_title, root_post_id, user_id)
     }]
 
 
@@ -353,6 +380,8 @@ def build_deadline_buttons(task_title, meta, user_id, root_post_id):
         act("dl_day_after", "Послезавтра", "day_after_tomorrow"),
         act("dl_custom", "Другая дата", "custom"),
     ]
+
+    add_cancel_action(actions, task_title, root_post_id, user_id)
 
     return [{
         "text": "Выберите дедлайн:",
@@ -415,66 +444,70 @@ def mm_actions():
 
     try:
         if step == "CHOOSE_PROJECT":
-            project_id = context["project_id"]
-            project_title = context.get("project_title", "без названия")
-            state = set_state(user_id, root_post_id, {
-                "step": "CHOOSE_PROJECT",
-                "task_title": task_title,
-                "project_id": project_id,
-                "channel_id": channel_id,
-            })
+        project_id = context["project_id"]
+        project_title = context.get("project_title", "без названия")
 
-            boards = yg_get_boards(project_id)
+        state = set_state(user_id, root_post_id, {
+            "step": "CHOOSE_PROJECT",
+            "task_title": task_title,
+            "project_id": project_id,
+            "channel_id": channel_id,
+        })
 
-            # сначала "замораживаем" старый пост без кнопок
-            mm_patch_post(
-                post_id,
-                message=f'Проект для задачи "{task_title}": {project_title}',
-                attachments=[]
+        boards = yg_get_boards(project_id)
+
+        # превращаем старое сообщение в "фикс выбора" без кнопок
+        mm_patch_post(
+            post_id,
+            message=f'Проект для задачи "{task_title}": {project_title}',
+            attachments=[]
+        )
+
+        if not boards:
+            mm_post(
+                channel_id,
+                message=f'В проекте "{project_title}" нет досок, задачу создать нельзя.',
+                root_id=root_post_id
             )
+            return "", 200
 
-            if not boards:
-                # вообще нет досок
-                mm_post(
-                    channel_id,
-                    message=f'В проекте "{project_title}" нет досок, задачу создать нельзя.',
-                    root_id=root_post_id
-                )
-                return "", 200
+        if len(boards) <= 1:
+            board = boards[0]
+            board_id = board["id"]
+            state = set_state(user_id, root_post_id, {"board_id": board_id})
 
-            if len(boards) <= 1:
-                # если одна доска – сразу к колонкам
-                board = boards[0]
-                board_id = board["id"]
-                state = set_state(user_id, root_post_id, {"board_id": board_id})
-
-                columns = yg_get_columns(board_id)
-                attachments = build_column_buttons(
-                    task_title, project_id, board_id, columns, user_id, root_post_id
-                )
-
-                # новый пост с выбором колонки
-                mm_post(
-                    channel_id,
-                    message=f'Выберите колонку для задачи "{task_title}"',
-                    attachments=attachments,
-                    root_id=root_post_id
-                )
-            else:
-                # несколько досок – задаём вопрос
-                attachments = build_board_buttons(
-                    task_title, project_id, boards, user_id, root_post_id
-                )
-                mm_post(
-                    channel_id,
-                    message=f'Выберите доску для задачи "{task_title}"',
-                    attachments=attachments,
-                    root_id=root_post_id
-                )
+            columns = yg_get_columns(board_id)
+            attachments = build_column_buttons(
+                task_title, project_id, board_id, columns, user_id, root_post_id
+            )
+            resp = mm_post(
+                channel_id,
+                message=f'Выберите колонку для задачи "{task_title}"',
+                attachments=attachments,
+                root_id=root_post_id
+            )
+            # запомним id этого поста, см. секцию с отменой
+            set_state(user_id, root_post_id, {
+                "post_ids": state.get("post_ids", []) + [resp["id"]]
+            })
+        else:
+            attachments = build_board_buttons(
+                task_title, project_id, boards, user_id, root_post_id
+            )
+            resp = mm_post(
+                channel_id,
+                message=f'Выберите доску для задачи "{task_title}"',
+                attachments=attachments,
+                root_id=root_post_id
+            )
+            set_state(user_id, root_post_id, {
+                "post_ids": state.get("post_ids", []) + [resp["id"]]
+            })
 
         elif step == "CHOOSE_BOARD":
             project_id = context["project_id"]
             board_id = context["board_id"]
+            board_title = context.get("board_title", "без названия")
 
             state = set_state(user_id, root_post_id, {
                 "step": "CHOOSE_BOARD",
@@ -487,25 +520,28 @@ def mm_actions():
                 task_title, project_id, board_id, columns, user_id, root_post_id
             )
 
-            # затираем кнопки выбора доски
+            # фиксируем выбор доски в текущем сообщении
             mm_patch_post(
                 post_id,
-                message=f'Доска для задачи "{task_title}" выбрана.',
+                message=f'Доска для задачи "{task_title}": {board_title}',
                 attachments=[]
             )
 
-            # новый пост с выбором колонки
-            mm_post(
+            resp = mm_post(
                 channel_id,
                 message=f'Выберите колонку для задачи "{task_title}"',
                 attachments=attachments,
                 root_id=root_post_id
             )
+            set_state(user_id, root_post_id, {
+                "post_ids": state.get("post_ids", []) + [resp["id"]]
+            })
 
         elif step == "CHOOSE_COLUMN":
             project_id = context["project_id"]
             board_id = context["board_id"]
             column_id = context["column_id"]
+            column_title = context.get("column_title", "без названия")
 
             state = set_state(user_id, root_post_id, {
                 "step": "CHOOSE_COLUMN",
@@ -514,25 +550,26 @@ def mm_actions():
                 "column_id": column_id,
             })
 
-            users = yg_get_board_users(board_id)
+            users = yg_get_project_users(project_id)
             attachments = build_assignee_select(
                 task_title, project_id, board_id, column_id, users, user_id, root_post_id
             )
 
-            # старый пост — фиксируем, что колонка выбрана
             mm_patch_post(
                 post_id,
-                message=f'Колонка для задачи "{task_title}" выбрана.',
+                message=f'Колонка для задачи "{task_title}": {column_title}',
                 attachments=[]
             )
 
-            # новый пост с выбором ответственного
-            mm_post(
+            resp = mm_post(
                 channel_id,
                 message=f'Кого назначить ответственным за задачу "{task_title}"?',
                 attachments=attachments,
                 root_id=root_post_id
             )
+            set_state(user_id, root_post_id, {
+                "post_ids": state.get("post_ids", []) + [resp["id"]]
+            })
 
         elif step == "CHOOSE_ASSIGNEE":
             selected = (data.get("context") or {}).get("selected_option") or (data.get("data") or {}).get("selected_option")
@@ -592,6 +629,37 @@ def mm_actions():
                 state = set_state(user_id, root_post_id, {"deadline": deadline_date})
                 # создаём задачу сразу
                 create_task_and_update_post(task_title, state, user_id, post_id)
+        
+        elif step == "CANCEL":
+            # достаём состояние
+            state = get_state(user_id, root_post_id) or {}
+            channel_id_state = state.get("channel_id", channel_id)
+            post_ids = state.get("post_ids", [])
+
+            # пробуем удалить все посты бота в этом треде
+            for pid in post_ids:
+                try:
+                    requests.delete(
+                        f"{MM_URL}/api/v4/posts/{pid}",
+                        headers=mm_headers,
+                        timeout=5
+                    )
+                except Exception as del_e:
+                    print("Error deleting post", pid, del_e)
+
+            clear_state(user_id, root_post_id)
+
+            # финальное сообщение в тред
+            mm_post(
+                channel_id_state,
+                message=(
+                    f'Хорошо, создание задачи "{task_title}" отменено. '
+                    f'Если передумаете — обратитесь ко мне снова.'
+                ),
+                root_id=root_post_id
+            )
+
+            return "", 200
 
         elif step == "FINISH":
             clear_state(user_id, root_post_id)
@@ -693,7 +761,6 @@ def run_ws_bot():
                     if not title:
                         continue
 
-                    # запускаем мастер: шаг выбор проекта
                     projects = yg_get_projects()
                     with STATE_LOCK:
                         STATE[(user_id, root_id)] = {
@@ -701,15 +768,19 @@ def run_ws_bot():
                             "task_title": title,
                             "root_post_id": root_id,
                             "channel_id": channel_id,
+                            "post_ids": [],   # список постов бота
                         }
 
                     attachments = build_project_buttons(title, projects, user_id, root_id)
-                    mm_post(
+                    resp = mm_post(
                         channel_id,
                         message=f'Выберите проект для задачи "{title}"',
                         attachments=attachments,
                         root_id=root_id
                     )
+                    set_state(user_id, root_id, {
+                        "post_ids": [resp["id"]]
+                    })
                     continue
 
                 # 2) если мы на шаге OPTIONAL_ATTACH и пользователь пишет что-то в треде
