@@ -3,12 +3,22 @@ import json
 import time
 import threading
 import re
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from collections import defaultdict
 
 import requests
 from flask import Flask, request, jsonify
 from websocket import create_connection, WebSocketConnectionClosedException
+
+from urllib.parse import quote
+
+def slugify_title(title: str) -> str:
+    s = (title or "").strip()
+    # пробелы → дефисы
+    s = re.sub(r"\s+", "-", s)
+    # схлопываем повторяющиеся дефисы
+    s = re.sub(r"-+", "-", s)
+    return quote(s)
 
 # ---------- ENV ----------
 MM_URL = os.getenv("MM_URL").rstrip("/")
@@ -206,8 +216,15 @@ def yg_create_task(title, column_id, description="", assignee_id=None, deadline=
     # дедлайн в формате YouGile
     if deadline:
         # deadline у нас date, превращаем в 00:00 локального дня и далее в миллисекунды
-        dt = datetime(deadline.year, deadline.month, deadline.day)
-        ms = int(dt.timestamp() * 1000)
+        # Полдень по UTC, чтобы дата не сдвигалась
+        dt_utc_noon = datetime(
+            deadline.year,
+            deadline.month,
+            deadline.day,
+            12, 0, 0,
+            tzinfo=timezone.utc,
+        )
+        ms = int(dt_utc_noon.timestamp() * 1000)
         body["deadline"] = {
             "deadline": ms,
             # "startDate": ms,          <-- Убрал, так как не нужно
@@ -473,6 +490,7 @@ def mm_actions():
                 "step": "CHOOSE_PROJECT",
                 "task_title": task_title,
                 "project_id": project_id,
+                "project_title": project_title,   # <-- ДОБАВИЛИ
                 "channel_id": channel_id,
             })
 
@@ -738,7 +756,22 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
 
     task = yg_create_task(task_title, column_id, description=description, assignee_id=assignee_id, deadline=deadline)
     task_id = task.get("id")
-    task_url = task.get("url", f"https://yougile.com/tasks/{task_id}" if task_id else "")
+    task_project_id = task.get("idTaskProject") or task.get("idTaskCommon")
+
+    # пробуем собрать "красивую" ссылку
+    project_title = state.get("project_title")
+    project_slug = slugify_title(project_title) if project_title else ""
+    company_id = YOUGILE_COMPANY_ID
+
+    if company_id and project_slug and task_project_id:
+        task_url = f"https://ru.yougile.com/team/{company_id}/{project_slug}#{task_project_id}"
+    else:
+        # fallback — вдруг что-то не пришло
+        task_url = f"https://ru.yougile.com/team/{company_id}" if company_id else ""
+
+    meta = {
+        "yougile_task_id": task_id,
+    }
 
     meta = {
         "yougile_task_id": task_id,
@@ -876,8 +909,15 @@ def run_ws_bot():
                             task = yg_get_task(task_id)
                             old_desc = task.get("description") or ""
                             ts = datetime.now().strftime("%d.%m.%Y %H:%M")
-                            addition = f'\n\nДополнено {ts}:\n{message}'
-                            new_desc = (old_desc or "") + addition
+                            # если описания нет — просто пишем текст;
+                            # если есть — вставляем два <br> перед блоком
+                            if old_desc:
+                                new_desc = (
+                                    f"{old_desc}<br><br>"
+                                    f"Дополнено {ts}:<br>{message}"
+                                )
+                            else:
+                                new_desc = f"Дополнено {ts}:<br>{message}"
                             yg_update_task_description(task_id, new_desc)
                         except Exception as e:
                             print("Error updating description in YouGile:", e)
