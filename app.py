@@ -846,11 +846,25 @@ def run_ws_bot():
                             )
                             continue
 
-                        # дата распарсилась — сохраняем дедлайн и создаём задачу
+                        # дата распарсилась — сохраняем дедлайн
                         st = set_state(user_id, root_id, {"deadline": d})
                         task_title = st.get("task_title", "Без названия")
-                        # патчим сообщение пользователя с датой на "задача создана"
-                        create_task_and_update_post(task_title, st, user_id, post.get("id"))
+
+                        # берём последний пост бота в этом диалоге
+                        post_ids = st.get("post_ids") or []
+                        target_post_id = post_ids[-1] if post_ids else None
+
+                        if target_post_id:
+                            # обновляем последний бот-пост (не пост пользователя!)
+                            create_task_and_update_post(task_title, st, user_id, target_post_id)
+                        else:
+                            # на всякий случай — если по какой-то причине нет post_ids,
+                            # просто создаём новый пост с результатом
+                            mm_post(
+                                channel_id,
+                                message=f'✅ Задача "{task_title}" создана (кастомный дедлайн).',
+                                root_id=root_id
+                            )
                         continue
 
                 # 3) если мы на шаге OPTIONAL_ATTACH и пользователь пишет что-то в треде
