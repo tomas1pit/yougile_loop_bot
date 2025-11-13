@@ -244,7 +244,7 @@ def build_project_buttons(task_title, projects, user_id, root_post_id):
     actions = []
     for p in projects:
         actions.append({
-            "id": f"project_{p['id']}",  # уникальный id
+            "id": f"project{idx}",  # БЕЗ _ и -
             "name": p.get("title", "Без имени"),
             "type": "button",
             "integration": {
@@ -270,7 +270,7 @@ def build_board_buttons(task_title, project_id, boards, user_id, root_post_id):
     actions = []
     for b in boards:
         actions.append({
-            "id": f"board_{b['id']}",  # уникальный
+            "id": f"board{idx}",  # вместо board_{b['id']}
             "name": b.get("title", "Без имени"),
             "type": "button",
             "integration": {
@@ -297,7 +297,7 @@ def build_column_buttons(task_title, project_id, board_id, columns, user_id, roo
     actions = []
     for c in columns:
         actions.append({
-            "id": f"column_{c['id']}",
+            "id": f"column{idx}",  # вместо column_{c['id']}
             "name": c.get("title", "Без имени"),
             "type": "button",
             "integration": {
@@ -375,10 +375,10 @@ def build_deadline_buttons(task_title, meta, user_id, root_post_id):
         }
 
     actions = [
-        act("dl_today", "Сегодня", "today"),
-        act("dl_tomorrow", "Завтра", "tomorrow"),
-        act("dl_day_after", "Послезавтра", "day_after_tomorrow"),
-        act("dl_custom", "Другая дата", "custom"),
+        act("dlToday", "Сегодня", "today"),
+        act("dlTomorrow", "Завтра", "tomorrow"),
+        act("dlDayAfter", "Послезавтра", "day_after_tomorrow"),
+        act("dlCustom", "Другая дата", "custom"),
     ]
 
     add_cancel_action(actions, task_title, root_post_id, user_id)
