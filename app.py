@@ -817,9 +817,8 @@ def build_finish_buttons(task_title, task_url, user_id, root_post_id, meta):
     ]
     return [{
         "text": (
-            f"Задача создана. Ссылка: {task_url}\n"
-            f"Можете написать дополнительный комментарий в этом треде, "
-            f'а затем нажать "Завершить".'
+            "Можете написать дополнительный комментарий и приложить файлы в этом треде, "
+            'а затем нажать "Завершить".'
         ),
         "actions": actions
     }]
@@ -1540,13 +1539,18 @@ def mm_actions():
 # ---------------------------------------------------------------------------
 #  Создание задачи в YouGile + обновление поста с кнопкой "Завершить"
 # ---------------------------------------------------------------------------
+
 def create_task_and_update_post(task_title, state, user_id, post_id):
     """
     Создаёт задачу в YouGile на основе state и:
-    - обновляет исходное сообщение с кнопками дедлайна на
-      "Дедлайн для задачи ...: ...",
-    - отправляет отдельное сообщение "✅ Задача ... создана" с ссылкой.
-    Также записывает всё нужное для финального резюме (FINISH / автозавершение).
+
+    1) Обновляет исходное сообщение с кнопками дедлайна на:
+       "Дедлайн для задачи "<название>": <выбор> (<дата DD.MM.YYYY>)"
+       (без attachments).
+    2) Отправляет отдельное сообщение в тред:
+       "✅ Задача "<название>" создана.\nСсылка: ..."
+       с action "Завершить" и приглашением добавить комментарии/файлы.
+    3) Обновляет state для FINISH и автозавершения.
     """
     mm_user = mm_get_user(user_id)
     first_name = mm_user.get("first_name", "").strip()
@@ -1612,41 +1616,57 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
     else:
         deadline_human = "без дедлайна"
 
+    # DD.MM.YYYY в скобках, если у нас вообще есть конкретная дата
+    if deadline:
+        deadline_date_str = deadline.strftime("%d.%m.%Y")
+        deadline_suffix = f" ({deadline_date_str})"
+    else:
+        deadline_suffix = ""
+
     # Для итогового summary будем использовать именно этот текст
-    deadline_str = deadline_human
+    deadline_str = f"{deadline_human}{deadline_suffix}".strip() or "без дедлайна"
 
     meta = {
         "yougile_task_id": task_id,
     }
-    attachments = build_finish_buttons(task_title, task_url, user_id, state.get("root_post_id"), meta)
 
-    # 1) Обновляем исходное сообщение (где были кнопки дедлайна)
+    root_post_id = state.get("root_post_id")
+    channel_id_state = state.get("channel_id")
+    post_ids = state.get("post_ids") or []
+
+    # 1) Обновляем исходное сообщение (где были кнопки дедлайна).
+    #    ВАЖНО: attachments убираем — на этом сообщении больше ничего интерактивного не нужно.
     mm_patch_post(
         post_id,
-        message=f'Дедлайн для задачи "{task_title}": {deadline_human}.',
-        attachments=attachments
+        message=f'Дедлайн для задачи "{task_title}": {deadline_human}{deadline_suffix}.',
+        attachments=[]
     )
 
-    # 2) Отдельное сообщение "✅ Задача создана" в тред
-    channel_id_state = state.get("channel_id")
-    root_post_id = state.get("root_post_id")
+    # 2) Отдельное сообщение "✅ Задача создана" в тред — здесь будет action "Завершить".
     if channel_id_state:
         success_msg = (
             f'✅ Задача "{task_title}" создана.\n'
             f"Ссылка: {task_url}"
         )
-        mm_post(
+
+        attachments = build_finish_buttons(task_title, task_url, user_id, root_post_id, meta)
+
+        resp = mm_post(
             channel_id_state,
             message=success_msg,
+            attachments=attachments,
             root_id=root_post_id
         )
+        # Добавим этот пост в список служебных, чтобы CANCEL мог их удалить при необходимости
+        post_ids = post_ids + [resp["id"]]
 
     # 3) Обновляем state для FINISH / автозавершения
-    set_state(user_id, state.get("root_post_id"), {
+    set_state(user_id, root_post_id, {
         "step": "OPTIONAL_ATTACH",
         "yougile_task_id": task_id,
         "task_url": task_url,
         "deadline_str": deadline_str,
+        "post_ids": post_ids,
     })
 
 def auto_finish_dialog(user_id, root_post_id):
