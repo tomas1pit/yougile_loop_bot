@@ -99,6 +99,62 @@ yg_headers = {
 STATE = defaultdict(dict)
 STATE_LOCK = threading.Lock()
 
+# ---------------------------------------------------------------------------
+#  Мэппинг: канал Loop (Mattermost) → проект YouGile по умолчанию
+# ---------------------------------------------------------------------------
+
+CHANNEL_MAP_FILE = os.getenv("CHANNEL_MAP_FILE", "/data/channel_project_map.json")
+CHANNEL_MAP_LOCK = threading.Lock()
+CHANNEL_PROJECT_MAP = {}  # channel_id -> {"project_id": ..., "project_title": ...}
+
+
+def load_channel_map():
+    global CHANNEL_PROJECT_MAP
+    if not CHANNEL_MAP_FILE:
+        CHANNEL_PROJECT_MAP = {}
+        return
+    try:
+        with open(CHANNEL_MAP_FILE, "r", encoding="utf-8") as f:
+            CHANNEL_PROJECT_MAP = json.load(f)
+    except FileNotFoundError:
+        CHANNEL_PROJECT_MAP = {}
+    except Exception as e:
+        print("Error loading channel map:", e)
+        CHANNEL_PROJECT_MAP = {}
+
+
+def save_channel_map():
+    if not CHANNEL_MAP_FILE:
+        return
+    tmp_path = CHANNEL_MAP_FILE + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(CHANNEL_PROJECT_MAP, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, CHANNEL_MAP_FILE)
+    except Exception as e:
+        print("Error saving channel map:", e)
+
+
+def get_default_project_for_channel(channel_id):
+    with CHANNEL_MAP_LOCK:
+        entry = CHANNEL_PROJECT_MAP.get(channel_id)
+        if not entry:
+            return None
+        return entry  # {"project_id": ..., "project_title": ...}
+
+def set_default_project_for_channel(channel_id, project_id, project_title):
+    with CHANNEL_MAP_LOCK:
+        CHANNEL_PROJECT_MAP[channel_id] = {
+            "project_id": project_id,
+            "project_title": project_title or "без названия",
+        }
+        save_channel_map()
+
+def delete_default_project_for_channel(channel_id):
+    with CHANNEL_MAP_LOCK:
+        if channel_id in CHANNEL_PROJECT_MAP:
+            CHANNEL_PROJECT_MAP.pop(channel_id, None)
+            save_channel_map()
 
 def set_state(user_id, root_post_id, data: dict):
     """
@@ -156,6 +212,12 @@ def mm_get_user(user_id):
     r.raise_for_status()
     return r.json()
 
+def mm_get_channel(channel_id):
+    """Получить данные канала (нужно для красивого имени чата)."""
+    url = f"{MM_URL}/api/v4/channels/{channel_id}"
+    r = requests.get(url, headers=mm_headers, timeout=10)
+    r.raise_for_status()
+    return r.json()
 
 def mm_post(channel_id, message, attachments=None, root_id=None):
     """
@@ -457,6 +519,43 @@ def yg_upload_file(file_bytes, filename, mimetype="application/octet-stream"):
 
     return file_url
 
+def get_allowed_projects_for_mm_user(user_id):
+    """
+    Возвращает список проектов YouGile, к которым у пользователя Loop есть доступ (по email).
+    """
+    try:
+        mm_user = mm_get_user(user_id)
+        mm_email = (mm_user.get("email") or "").strip().lower()
+    except Exception as e:
+        print("Error fetching MM user for project filter:", e)
+        mm_email = ""
+
+    try:
+        all_projects = yg_get_projects()
+    except Exception as e:
+        print("Error fetching YouGile projects:", e)
+        all_projects = []
+
+    allowed_projects = []
+    if mm_email:
+        for p in all_projects:
+            project_id = p.get("id")
+            if not project_id:
+                continue
+            try:
+                users = yg_get_project_users(project_id)
+            except Exception as e:
+                print(f"Error fetching users for project {project_id}:", e)
+                continue
+
+            for u in users:
+                u_email = (u.get("email") or "").strip().lower()
+                if u_email and u_email == mm_email:
+                    allowed_projects.append(p)
+                    break
+
+    return allowed_projects
+
 
 # ---------------------------------------------------------------------------
 #  Дедлайны
@@ -509,87 +608,115 @@ def add_cancel_action(actions, task_title, root_post_id, user_id):
     return actions
 
 
-def build_project_buttons(task_title, projects, user_id, root_post_id):
-    """Кнопки выбора проекта."""
-    actions = []
-    for idx, p in enumerate(projects):
-        actions.append({
-            "id": f"project{idx}",  # важно: без дефисов и подчёркиваний
-            "name": p.get("title", "Без имени"),
-            "type": "button",
-            "integration": {
-                "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
-                "context": {
-                    "step": "CHOOSE_PROJECT",
-                    "task_title": task_title,
-                    "project_id": p["id"],
-                    "project_title": p.get("title", "Без имени"),
-                    "root_post_id": root_post_id,
-                    "user_id": user_id,
-                }
-            }
+def build_project_select_for_task(task_title, projects, user_id, root_post_id):
+    """
+    Выпадающий список проектов для создания задачи.
+    """
+    options = []
+    for p in projects:
+        pid = p.get("id")
+        title = p.get("title", "Без имени")
+        if not pid:
+            continue
+        options.append({
+            "text": title,
+            "value": pid
         })
-    add_cancel_action(actions, task_title, root_post_id, user_id)
+
+    select_action = {
+        "id": "projectSelect",
+        "name": "Выберите проект",
+        "type": "select",
+        "options": options,
+        "integration": {
+            "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
+            "context": {
+                "step": "CHOOSE_PROJECT",
+                "task_title": task_title,
+                "root_post_id": root_post_id,
+                "user_id": user_id,
+            }
+        }
+    }
+
     return [{
-        "text": "Проекты:",
-        "actions": actions
+        "text": "Проект:",
+        "actions": add_cancel_action([select_action], task_title, root_post_id, user_id)
     }]
-
-
-def build_board_buttons(task_title, project_id, boards, user_id, root_post_id):
-    """Кнопки выбора доски."""
-    actions = []
-    for idx, b in enumerate(boards):
-        actions.append({
-            "id": f"board{idx}",
-            "name": b.get("title", "Без имени"),
-            "type": "button",
-            "integration": {
-                "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
-                "context": {
-                    "step": "CHOOSE_BOARD",
-                    "task_title": task_title,
-                    "project_id": project_id,
-                    "board_id": b["id"],
-                    "board_title": b.get("title", "Без имени"),
-                    "root_post_id": root_post_id,
-                    "user_id": user_id,
-                }
-            }
+    
+def build_board_select_for_task(task_title, project_id, boards, user_id, root_post_id):
+    """
+    Выпадающий список досок для выбранного проекта.
+    """
+    options = []
+    for b in boards:
+        bid = b.get("id")
+        title = b.get("title", "Без имени")
+        if not bid:
+            continue
+        options.append({
+            "text": title,
+            "value": bid
         })
-    add_cancel_action(actions, task_title, root_post_id, user_id)
+
+    select_action = {
+        "id": "boardSelect",
+        "name": "Выберите доску",
+        "type": "select",
+        "options": options,
+        "integration": {
+            "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
+            "context": {
+                "step": "CHOOSE_BOARD",
+                "task_title": task_title,
+                "project_id": project_id,
+                "root_post_id": root_post_id,
+                "user_id": user_id,
+            }
+        }
+    }
+
     return [{
-        "text": "Доски:",
-        "actions": actions
+        "text": "Доска:",
+        "actions": add_cancel_action([select_action], task_title, root_post_id, user_id)
     }]
-
-
-def build_column_buttons(task_title, project_id, board_id, columns, user_id, root_post_id):
-    """Кнопки выбора колонки."""
-    actions = []
-    for idx, c in enumerate(columns):
-        actions.append({
-            "id": f"column{idx}",
-            "name": c.get("title", "Без имени"),
-            "type": "button",
-            "integration": {
-                "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
-                "context": {
-                    "step": "CHOOSE_COLUMN",
-                    "task_title": task_title,
-                    "project_id": project_id,
-                    "board_id": board_id,
-                    "column_id": c["id"],
-                    "column_title": c.get("title", "Без имени"),
-                    "root_post_id": root_post_id,
-                    "user_id": user_id,
-                }
-            }
+    
+def build_column_select_for_task(task_title, project_id, board_id, columns, user_id, root_post_id):
+    """
+    Выпадающий список колонок для выбранной доски.
+    """
+    options = []
+    for c in columns:
+        cid = c.get("id")
+        title = c.get("title", "Без имени")
+        if not cid:
+            continue
+        options.append({
+            "text": title,
+            "value": cid
         })
-    add_cancel_action(actions, task_title, root_post_id, user_id)
+
+    select_action = {
+        "id": "columnSelect",
+        "name": "Выберите колонку",
+        "type": "select",
+        "options": options,
+        "integration": {
+            "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
+            "context": {
+                "step": "CHOOSE_COLUMN",
+                "task_title": task_title,
+                "project_id": project_id,
+                "board_id": board_id,
+                "root_post_id": root_post_id,
+                "user_id": user_id,
+            }
+        }
+    }
+
     return [{
-        "text": "Колонки:",
-        "actions": actions
+        "text": "Колонка:",
+        "actions": add_cancel_action([select_action], task_title, root_post_id, user_id)
     }]
 
 
@@ -696,6 +823,76 @@ def build_finish_buttons(task_title, task_url, user_id, root_post_id, meta):
         ),
         "actions": actions
     }]
+    
+def build_main_menu_attachments(user_id, root_post_id):
+    """
+    Главное меню бота:
+    - Создать задачу
+    - Показать быстрые команды
+    - Сменить проект по умолчанию для чата
+    - Завершить диалог
+    """
+    actions = [
+        {
+            "id": "menuCreateTask",
+            "name": "Создать задачу",
+            "type": "button",
+            "style": "primary",
+            "integration": {
+                "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
+                "context": {
+                    "step": "MENU_CREATE_TASK",
+                    "user_id": user_id,
+                    "root_post_id": root_post_id,
+                }
+            }
+        },
+        {
+            "id": "menuShowShortcuts",
+            "name": "Показать быстрые команды",
+            "type": "button",
+            "integration": {
+                "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
+                "context": {
+                    "step": "MENU_SHOW_SHORTCUTS",
+                    "user_id": user_id,
+                    "root_post_id": root_post_id,
+                }
+            }
+        },
+        {
+            "id": "menuChangeDefaultProject",
+            "name": "Сменить проект по умолчанию",
+            "type": "button",
+            "integration": {
+                "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
+                "context": {
+                    "step": "MENU_CHANGE_DEFAULT_PROJECT",
+                    "user_id": user_id,
+                    "root_post_id": root_post_id,
+                }
+            }
+        },
+        {
+            "id": "menuCancel",
+            "name": "Завершить диалог",
+            "type": "button",
+            "style": "danger",
+            "integration": {
+                "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
+                "context": {
+                    "step": "MENU_CANCEL",
+                    "user_id": user_id,
+                    "root_post_id": root_post_id,
+                }
+            }
+        },
+    ]
+
+    return [{
+        "text": "Привет! Вот что я умею:",
+        "actions": actions
+    }]
 
 
 # ---------------------------------------------------------------------------
@@ -720,12 +917,15 @@ def mm_actions():
     - ручное завершение диалога
     """
     data = request.get_json(force=True, silent=True) or {}
-    context = data.get("context", {})
+    context = data.get("context", {}) or {}
     step = context.get("step")
-    user_id = context.get("user_id")
-    root_post_id = context.get("root_post_id")
+
+    # кто реально нажал кнопку — берём из запроса, если в контексте нет
+    user_id = context.get("user_id") or data.get("user_id")
     post_id = data.get("post_id")
     channel_id = data.get("channel_id")
+    # если root_post_id не передан в контексте, берём сам post_id
+    root_post_id = context.get("root_post_id") or data.get("root_id") or post_id
 
     if not (step and user_id and root_post_id and post_id and channel_id):
         return "", 200
@@ -734,10 +934,271 @@ def mm_actions():
     task_title = context.get("task_title") or state.get("task_title", "Без названия")
 
     try:
-        # ---------- ВЫБОР ПРОЕКТА ----------
-        if step == "CHOOSE_PROJECT":
-            project_id = context["project_id"]
-            project_title = context.get("project_title", "без названия")
+        # ---------- ГЛАВНОЕ МЕНЮ ----------
+        if step == "MENU_CREATE_TASK":
+            # Начинаем диалог: ждём название задачи
+            set_state(user_id, root_post_id, {
+                "step": "ASK_TASK_TITLE",
+                "channel_id": channel_id,
+                "task_title": None,
+            })
+
+            # Кнопка "Отменить" для этого шага
+            attachments = [{
+                "text": "Назовите задачу:",
+                "actions": add_cancel_action([], "Без названия", root_post_id, user_id)
+            }]
+
+            mm_patch_post(
+                post_id,
+                message='Пожалуйста, введите название задачи в этом треде.',
+                attachments=attachments
+            )
+
+            return "", 200
+
+        elif step == "MENU_SHOW_SHORTCUTS":
+            shortcuts_text = (
+                "Быстрые команды:\n"
+                "- `создай задачу <название задачи>` — сразу запустить мастер создания задачи.\n\n"
+                "Можно также воспользоваться главным меню, упомянув бота."
+            )
+            mm_post(
+                channel_id,
+                message=shortcuts_text,
+                root_id=root_post_id
+            )
+            return "", 200
+
+        elif step == "MENU_CHANGE_DEFAULT_PROJECT":
+            # Показываем текущий проект по умолчанию и даём выбрать новый
+            allowed_projects = get_allowed_projects_for_mm_user(user_id)
+            if not allowed_projects:
+                mm_post(
+                    channel_id,
+                    message="Не нашёл для вас доступных проектов в YouGile. Обратитесь к администратору.",
+                    root_id=root_post_id
+                )
+                return "", 200
+
+            project_options = {
+                p["id"]: p.get("title", "Без имени")
+                for p in allowed_projects
+                if p.get("id")
+            }
+
+            channel = mm_get_channel(channel_id)
+            channel_name = channel.get("display_name") or channel.get("name") or channel_id
+
+            current = get_default_project_for_channel(channel_id)
+            if current:
+                current_title = current.get("project_title", "не установлен")
+            else:
+                current_title = "не установлен"
+
+            set_state(user_id, root_post_id, {
+                "step": "MENU_CHANGE_DEFAULT_PROJECT",
+                "channel_id": channel_id,
+                "project_options": project_options,
+            })
+
+            options = [
+                {"text": title, "value": pid}
+                for pid, title in project_options.items()
+            ]
+
+            select_action = {
+                "id": "defaultProjectSelectChange",
+                "name": "Выберите новый проект",
+                "type": "select",
+                "options": options,
+                "integration": {
+                    "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
+                    "context": {
+                        "step": "MENU_DEFAULT_PROJECT_SET",
+                        "root_post_id": root_post_id,
+                    }
+                }
+            }
+
+            cancel_action = {
+                "id": "cancelDefaultProjectChange",
+                "name": "Не менять",
+                "type": "button",
+                "integration": {
+                    "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
+                    "context": {
+                        "step": "MENU_DEFAULT_PROJECT_CANCEL",
+                        "root_post_id": root_post_id,
+                    }
+                }
+            }
+
+            text = (
+                f'Сейчас проект по умолчанию для чата "{channel_name}": {current_title}\n'
+                f"Выберите новый проект:"
+            )
+
+            attachments = [{
+                "text": text,
+                "actions": [select_action, cancel_action]
+            }]
+
+            mm_patch_post(
+                post_id,
+                message=text,
+                attachments=attachments
+            )
+
+            return "", 200
+
+        elif step == "MENU_DEFAULT_PROJECT_CANCEL":
+            mm_patch_post(
+                post_id,
+                message="Смена проекта по умолчанию отменена. Старое значение сохранено.",
+                attachments=[]
+            )
+            clear_state(user_id, root_post_id)
+            return "", 200
+
+        elif step == "MENU_DEFAULT_PROJECT_SET":
+            selected = (data.get("context") or {}).get("selected_option") or (data.get("data") or {}).get("selected_option")
+            if isinstance(selected, dict):
+                project_id = selected.get("value")
+            else:
+                project_id = selected
+            if not project_id:
+                return "", 200
+
+            st = get_state(user_id, root_post_id) or {}
+            project_options = st.get("project_options", {})
+            project_title = project_options.get(project_id, "без названия")
+
+            set_default_project_for_channel(channel_id, project_id, project_title)
+
+            mm_patch_post(
+                post_id,
+                message=f'Проект по умолчанию для этого чата изменён на: {project_title}',
+                attachments=[]
+            )
+
+            clear_state(user_id, root_post_id)
+            return "", 200
+
+        elif step == "MENU_CANCEL":
+            mm_patch_post(
+                post_id,
+                message="Диалог с ботом завершён. Если что — зовите ещё! :wink:",
+                attachments=[]
+            )
+            clear_state(user_id, root_post_id)
+            return "", 200
+        
+        # ---------- ВОПРОС ПРО ПРОЕКТ ПО УМОЛЧАНИЮ (ПРИ ДОБАВЛЕНИИ В КАНАЛ) ----------
+        elif step == "DEFAULT_PROJECT_PROMPT_NO":
+            mm_post(
+                channel_id,
+                message="Ок, проект по умолчанию для этого чата не установлен. Буду спрашивать проект при создании задач.",
+                root_id=root_post_id
+            )
+            return "", 200
+
+        elif step == "DEFAULT_PROJECT_PROMPT_YES":
+            # user_id здесь - тот, кто нажал кнопку
+            allowed_projects = get_allowed_projects_for_mm_user(user_id)
+            if not allowed_projects:
+                mm_post(
+                    channel_id,
+                    message="Не нашёл для вас доступных проектов в YouGile. Обратитесь к администратору.",
+                    root_id=root_post_id
+                )
+                return "", 200
+
+            project_options = {
+                p["id"]: p.get("title", "Без имени")
+                for p in allowed_projects
+                if p.get("id")
+            }
+
+            # сохраняем state, чтобы потом по id получить title
+            st = set_state(user_id, root_post_id, {
+                "step": "DEFAULT_PROJECT_SELECT",
+                "channel_id": channel_id,
+                "project_options": project_options,
+            })
+
+            # строим select из проектов
+            options = [
+                {"text": title, "value": pid}
+                for pid, title in project_options.items()
+            ]
+
+            select_action = {
+                "id": "defaultProjectSelect",
+                "name": "Выберите проект",
+                "type": "select",
+                "options": options,
+                "integration": {
+                    "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
+                    "context": {
+                        "step": "DEFAULT_PROJECT_SET",
+                        "root_post_id": root_post_id,
+                    }
+                }
+            }
+
+            attachments = [{
+                "text": "Выберите проект по умолчанию для этого чата:",
+                "actions": [select_action]
+            }]
+
+            mm_post(
+                channel_id,
+                message="Проект по умолчанию:",
+                attachments=attachments,
+                root_id=root_post_id
+            )
+
+            return "", 200
+
+        elif step == "DEFAULT_PROJECT_SET":
+            # выбираем проект по умолчанию для чата
+            selected = (data.get("context") or {}).get("selected_option") or (data.get("data") or {}).get("selected_option")
+            if isinstance(selected, dict):
+                project_id = selected.get("value")
+            else:
+                project_id = selected
+            if not project_id:
+                return "", 200
+
+            st = get_state(user_id, root_post_id) or {}
+            project_options = st.get("project_options", {})
+            project_title = project_options.get(project_id, "без названия")
+
+            set_default_project_for_channel(channel_id, project_id, project_title)
+
+            mm_post(
+                channel_id,
+                message=f'Проект по умолчанию для этого чата установлен: {project_title}',
+                root_id=root_post_id
+            )
+
+            clear_state(user_id, root_post_id)
+            return "", 200
+        
+        # ---------- ВЫБОР ПРОЕКТА (через select) ----------
+        elif step == "CHOOSE_PROJECT":
+            selected = (data.get("context") or {}).get("selected_option") or (data.get("data") or {}).get("selected_option")
+            if isinstance(selected, dict):
+                project_id = selected.get("value")
+            else:
+                project_id = selected
+            if not project_id:
+                return "", 200
+
+            state = get_state(user_id, root_post_id) or {}
+            project_options = state.get("project_options", {})
+            project_title = project_options.get(project_id, "без названия")
 
             state = set_state(user_id, root_post_id, {
                 "step": "CHOOSE_PROJECT",
@@ -763,20 +1224,30 @@ def mm_actions():
                 )
                 return "", 200
 
-            if len(boards) <= 1:
+            if len(boards) == 1:
                 board = boards[0]
                 board_id = board["id"]
                 board_title = board.get("title", "без названия")
 
                 state = set_state(user_id, root_post_id, {
+                    "step": "CHOOSE_BOARD",
                     "board_id": board_id,
                     "board_title": board_title,
                 })
 
                 columns = yg_get_columns(board_id)
-                attachments = build_column_buttons(
-                    task_title, project_id, board_id, columns, user_id, root_post_id
-                )
+                if not columns:
+                    mm_post(
+                        channel_id,
+                        message=f'На доске "{board_title}" нет колонок, задачу создать нельзя.',
+                        root_id=root_post_id
+                    )
+                    return "", 200
+
+                column_options = {c["id"]: c.get("title", "Без имени") for c in columns if c.get("id")}
+                set_state(user_id, root_post_id, {"column_options": column_options})
+
+                attachments = build_column_select_for_task(task_title, project_id, board_id, columns, user_id, root_post_id)
                 resp = mm_post(
                     channel_id,
                     message=f'Выберите колонку для задачи "{task_title}"',
@@ -787,9 +1258,10 @@ def mm_actions():
                     "post_ids": state.get("post_ids", []) + [resp["id"]]
                 })
             else:
-                attachments = build_board_buttons(
-                    task_title, project_id, boards, user_id, root_post_id
-                )
+                board_options = {b["id"]: b.get("title", "Без имени") for b in boards if b.get("id")}
+                set_state(user_id, root_post_id, {"board_options": board_options})
+
+                attachments = build_board_select_for_task(task_title, project_id, boards, user_id, root_post_id)
                 resp = mm_post(
                     channel_id,
                     message=f'Выберите доску для задачи "{task_title}"',
@@ -802,9 +1274,18 @@ def mm_actions():
 
         # ---------- ВЫБОР ДОСКИ ----------
         elif step == "CHOOSE_BOARD":
-            project_id = context["project_id"]
-            board_id = context["board_id"]
-            board_title = context.get("board_title", "без названия")
+            selected = (data.get("context") or {}).get("selected_option") or (data.get("data") or {}).get("selected_option")
+            if isinstance(selected, dict):
+                board_id = selected.get("value")
+            else:
+                board_id = selected
+            if not board_id:
+                return "", 200
+
+            state = get_state(user_id, root_post_id) or {}
+            project_id = state.get("project_id") or context.get("project_id")
+            board_options = state.get("board_options", {})
+            board_title = board_options.get(board_id, "без названия")
 
             state = set_state(user_id, root_post_id, {
                 "step": "CHOOSE_BOARD",
@@ -814,9 +1295,18 @@ def mm_actions():
             })
 
             columns = yg_get_columns(board_id)
-            attachments = build_column_buttons(
-                task_title, project_id, board_id, columns, user_id, root_post_id
-            )
+            if not columns:
+                mm_patch_post(
+                    post_id,
+                    message=f'На доске "{board_title}" нет колонок, задачу создать нельзя.',
+                    attachments=[]
+                )
+                return "", 200
+
+            column_options = {c["id"]: c.get("title", "Без имени") for c in columns if c.get("id")}
+            set_state(user_id, root_post_id, {"column_options": column_options})
+
+            attachments = build_column_select_for_task(task_title, project_id, board_id, columns, user_id, root_post_id)
 
             mm_patch_post(
                 post_id,
@@ -836,10 +1326,19 @@ def mm_actions():
 
         # ---------- ВЫБОР КОЛОНКИ ----------
         elif step == "CHOOSE_COLUMN":
-            project_id = context["project_id"]
-            board_id = context["board_id"]
-            column_id = context["column_id"]
-            column_title = context.get("column_title", "без названия")
+            selected = (data.get("context") or {}).get("selected_option") or (data.get("data") or {}).get("selected_option")
+            if isinstance(selected, dict):
+                column_id = selected.get("value")
+            else:
+                column_id = selected
+            if not column_id:
+                return "", 200
+
+            state = get_state(user_id, root_post_id) or {}
+            project_id = state.get("project_id") or context.get("project_id")
+            board_id = state.get("board_id") or context.get("board_id")
+            column_options = state.get("column_options", {})
+            column_title = column_options.get(column_id, "без названия")
 
             state = set_state(user_id, root_post_id, {
                 "step": "CHOOSE_COLUMN",
@@ -955,6 +1454,7 @@ def mm_actions():
             state = get_state(user_id, root_post_id) or {}
             channel_id_state = state.get("channel_id", channel_id)
             post_ids = state.get("post_ids", [])
+            task_title = context.get("task_title") or state.get("task_title") or "Без названия"
 
             for pid in post_ids:
                 try:
@@ -968,12 +1468,14 @@ def mm_actions():
 
             clear_state(user_id, root_post_id)
 
+            if task_title == "Без названия" or not task_title:
+                msg = "Хорошо, создание задачи отменено."
+            else:
+                msg = f'Хорошо, создание задачи "{task_title}" отменено.'
+
             mm_post(
                 channel_id_state,
-                message=(
-                    f'Хорошо, создание задачи "{task_title}" отменено. '
-                    f'Если передумаете — обратитесь ко мне снова.'
-                ),
+                message=msg,
                 root_id=root_post_id
             )
 
@@ -1004,10 +1506,10 @@ def mm_actions():
                 root_id=root_post_id
             )
 
-            mm_post(
-                channel_id_state,
-                message=summary
-            )
+            # mm_post(
+            #     channel_id_state,
+            #     message=summary
+            # )
 
             mm_patch_post(
                 post_id,
@@ -1140,11 +1642,146 @@ def auto_finish_dialog(user_id, root_post_id):
     )
 
     mm_post(
-        channel_id_state,
-        message=f"(Автозавершение) {summary}"
+        channel_id_state, 
+        message="(Автозавершение диалога)", 
+        root_id=root_post_id
     )
 
     clear_state(user_id, root_post_id)
+    
+def start_task_creation(user_id, channel_id, root_id, title):
+    """
+    Запуск мастера создания задачи:
+    - определяем проекты YouGile, к которым пользователь имеет доступ
+    - учитываем проект по умолчанию для канала (если задан)
+    - дальше: выбор доски, колонки, исполнителя, дедлайна
+    """
+    allowed_projects = get_allowed_projects_for_mm_user(user_id)
+
+    # 4) нет доступных проектов
+    if not allowed_projects:
+        no_access_msg = (
+            "Извините, но кажется у вас нет доступа к проектам в нашей доске YouGile.\n"
+            "Обратитесь за помощью к администратору.\n"
+            "Мне очень жаль :cry:"
+        )
+        mm_post(
+            channel_id,
+            message=no_access_msg,
+            root_id=root_id
+        )
+        return
+
+    # 5) проверяем проект по умолчанию для этого канала
+    default_entry = get_default_project_for_channel(channel_id)
+    default_project = None
+    if default_entry:
+        for p in allowed_projects:
+            if p.get("id") == default_entry.get("project_id"):
+                default_project = p
+                break
+
+    if default_project:
+        project_id = default_project["id"]
+        project_title = default_project.get("title", "без названия")
+
+        state = set_state(user_id, root_id, {
+            "step": "CHOOSE_PROJECT",
+            "task_title": title,
+            "root_post_id": root_id,
+            "channel_id": channel_id,
+            "project_id": project_id,
+            "project_title": project_title,
+            "post_ids": [],
+        })
+
+        boards = yg_get_boards(project_id)
+
+        if not boards:
+            mm_post(
+                channel_id,
+                message=f'В проекте "{project_title}" нет досок, задачу создать нельзя.',
+                root_id=root_id
+            )
+            return
+
+        if len(boards) == 1:
+            board = boards[0]
+            board_id = board["id"]
+            board_title = board.get("title", "без названия")
+
+            state = set_state(user_id, root_id, {
+                "step": "CHOOSE_BOARD",
+                "board_id": board_id,
+                "board_title": board_title,
+            })
+
+            columns = yg_get_columns(board_id)
+            if not columns:
+                mm_post(
+                    channel_id,
+                    message=f'На доске "{board_title}" нет колонок, задачу создать нельзя.',
+                    root_id=root_id
+                )
+                return
+
+            column_options = {c["id"]: c.get("title", "Без имени") for c in columns if c.get("id")}
+            set_state(user_id, root_id, {"column_options": column_options})
+
+            attachments = build_column_select_for_task(title, project_id, board_id, columns, user_id, root_id)
+            resp = mm_post(
+                channel_id,
+                message=f'Выберите колонку для задачи "{title}"',
+                attachments=attachments,
+                root_id=root_id
+            )
+            set_state(user_id, root_id, {
+                "post_ids": state.get("post_ids", []) + [resp["id"]]
+            })
+        else:
+            board_options = {b["id"]: b.get("title", "Без имени") for b in boards if b.get("id")}
+            set_state(user_id, root_id, {"board_options": board_options})
+
+            attachments = build_board_select_for_task(title, project_id, boards, user_id, root_id)
+            resp = mm_post(
+                channel_id,
+                message=f'Выберите доску для задачи "{title}"',
+                attachments=attachments,
+                root_id=root_id
+            )
+            set_state(user_id, root_id, {
+                "post_ids": state.get("post_ids", []) + [resp["id"]]
+            })
+
+        return
+
+    # нет проекта по умолчанию — выбираем проект select'ом
+    project_options = {
+        p["id"]: p.get("title", "Без имени")
+        for p in allowed_projects
+        if p.get("id")
+    }
+
+    with STATE_LOCK:
+        STATE[(user_id, root_id)] = {
+            "step": "CHOOSE_PROJECT",
+            "task_title": title,
+            "root_post_id": root_id,
+            "channel_id": channel_id,
+            "post_ids": [],
+            "project_options": project_options,
+        }
+
+    attachments = build_project_select_for_task(title, allowed_projects, user_id, root_id)
+    resp = mm_post(
+        channel_id,
+        message=f'Выберите проект для задачи "{title}"',
+        attachments=attachments,
+        root_id=root_id
+    )
+    set_state(user_id, root_id, {
+        "post_ids": [resp["id"]]
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1176,9 +1813,75 @@ def run_ws_bot():
                 msg = ws.recv()
                 if not msg:
                     continue
-                data = json.loads(msg)
 
-                if data.get("event") != "posted":
+                try:
+                    data = json.loads(msg)
+                except Exception as e:
+                    print("WS json error:", e, msg[:200])
+                    continue
+
+                event = data.get("event")
+
+                # --- Бота добавили в канал: спрашиваем про проект по умолчанию ---
+                if event == "added_to_channel":
+                    ev = data.get("data", {}) or {}
+                    channel_id_ev = ev.get("channel_id")
+                    added_user_id = ev.get("user_id")
+                    bot_id = get_bot_user_id()
+
+                    if bot_id and added_user_id == bot_id and channel_id_ev:
+                        prompt = (
+                            "Я только что добавлен в этот канал.\n"
+                            "Хотите установить проект по умолчанию для этого чата?"
+                        )
+                        attachments = [{
+                            "text": "Выберите действие:",
+                            "actions": [
+                                {
+                                    "id": "defaultProjectYes",
+                                    "name": "Да, выбрать проект",
+                                    "type": "button",
+                                    "style": "primary",
+                                    "integration": {
+                                        "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
+                                        "context": {
+                                            "step": "DEFAULT_PROJECT_PROMPT_YES",
+                                        }
+                                    }
+                                },
+                                {
+                                    "id": "defaultProjectNo",
+                                    "name": "Нет, буду задавать проект отдельно",
+                                    "type": "button",
+                                    "integration": {
+                                        "url": f"{BOT_PUBLIC_URL}/mattermost/actions",
+                                        "context": {
+                                            "step": "DEFAULT_PROJECT_PROMPT_NO",
+                                        }
+                                    }
+                                },
+                            ]
+                        }]
+
+                        mm_post(
+                            channel_id_ev,
+                            message=prompt,
+                            attachments=attachments,
+                            root_id=None
+                        )
+                    continue
+
+                # --- Бота удалили из канала: чистим меппинг ---
+                if event in ("user_removed_from_channel", "leave_channel"):
+                    ev = data.get("data", {}) or {}
+                    channel_id_ev = ev.get("channel_id")
+                    user_id_ev = ev.get("user_id")
+                    bot_id = get_bot_user_id()
+                    if bot_id and user_id_ev == bot_id and channel_id_ev:
+                        delete_default_project_for_channel(channel_id_ev)
+                    continue
+
+                if event != "posted":
                     continue
 
                 post = decode_mm_post_from_event(data)
@@ -1194,94 +1897,19 @@ def run_ws_bot():
                 if f"@{MM_BOT_USERNAME}" in message.lower():
                     title = parse_create_command(message, MM_BOT_USERNAME)
 
-                    # Если команда непонятна — показываем хелп
-                    if not title:
-                        help_text = (
-                            ":huh: Привет!\n"
-                            "Я пока глупенький и умею работать только со следующей командой:\n"
-                            "- `создай задачу <название задачи>`\n\n"
-                            "Попробуйте ещё раз, пожалуйста, используя команду выше.\n"
-                            "Спасибо! :thanks:"
-                        )
-                        mm_post(
-                            channel_id,
-                            message=help_text,
-                            root_id=root_id
-                        )
+                    if title:
+                        # быстрая команда: сразу запускаем мастер
+                        start_task_creation(user_id, channel_id, root_id, title)
                         continue
 
-                    # 1.1. Получаем email пользователя из Loop
-                    try:
-                        mm_user = mm_get_user(user_id)
-                        mm_email = (mm_user.get("email") or "").strip().lower()
-                    except Exception as e:
-                        print("Error fetching MM user for project filter:", e)
-                        mm_email = ""
-
-                    # 1.2. Получаем все проекты из YouGile
-                    try:
-                        all_projects = yg_get_projects()
-                    except Exception as e:
-                        print("Error fetching YouGile projects:", e)
-                        all_projects = []
-
-                    # 1.3. Фильтруем проекты по участию пользователя (по email)
-                    allowed_projects = []
-
-                    if mm_email:
-                        for p in all_projects:
-                            project_id = p.get("id")
-                            if not project_id:
-                                continue
-                            try:
-                                users = yg_get_project_users(project_id)
-                            except Exception as e:
-                                print(f"Error fetching users for project {project_id}:", e)
-                                continue
-
-                            for u in users:
-                                u_email = (u.get("email") or "").strip().lower()
-                                if u_email and u_email == mm_email:
-                                    allowed_projects.append(p)
-                                    break
-                    else:
-                        # У пользователя нет email в Loop — считаем, что нет доступа ни к одному проекту
-                        allowed_projects = []
-
-                    # 1.4. Если нет ни одного доступного проекта — завершаем диалог
-                    if not allowed_projects:
-                        no_access_msg = (
-                            "Извините, но кажется у вас нет доступа к проектам в нашей доске YouGile.\n"
-                            "Обратитесь за помощью к администратору.\n"
-                            "Мне очень жаль :cry:"
-                        )
-                        mm_post(
-                            channel_id,
-                            message=no_access_msg,
-                            root_id=root_id
-                        )
-                        continue
-
-                    # 1.5. Если проекты есть — запускаем мастер, как раньше
-                    with STATE_LOCK:
-                        STATE[(user_id, root_id)] = {
-                            "step": "CHOOSE_PROJECT",
-                            "task_title": title,
-                            "root_post_id": root_id,
-                            "channel_id": channel_id,
-                            "post_ids": [],
-                        }
-
-                    attachments = build_project_buttons(title, allowed_projects, user_id, root_id)
-                    resp = mm_post(
+                    # иначе показываем главное меню
+                    attachments = build_main_menu_attachments(user_id, root_id)
+                    mm_post(
                         channel_id,
-                        message=f'Выберите проект для задачи "{title}"',
+                        message="Привет! Вот что я умею:",
                         attachments=attachments,
                         root_id=root_id
                     )
-                    set_state(user_id, root_id, {
-                        "post_ids": [resp["id"]]
-                    })
                     continue
 
                 # ---------- 2) Ожидание кастомной даты дедлайна ----------
@@ -1317,6 +1945,19 @@ def run_ws_bot():
                                 root_id=root_id
                             )
                         continue
+
+                # ---------- 2b) Ожидание названия задачи после MENU_CREATE_TASK ----------
+                st = get_state(user_id, root_id)
+                if st and st.get("step") == "ASK_TASK_TITLE":
+                    title_text = (message or "").strip()
+                    if not title_text:
+                        continue
+
+                    set_state(user_id, root_id, {
+                        "task_title": title_text
+                    })
+                    start_task_creation(user_id, channel_id, root_id, title_text)
+                    continue
 
                 # ---------- 3) Дополнительные комментарии / файлы после создания задачи ----------
                 st = get_state(user_id, root_id)
@@ -1382,14 +2023,12 @@ def run_ws_bot():
 
                         # обновляем updated_at, чтобы авто-завершение шло от последнего действия
                         set_state(user_id, root_id, {})
-
         except WebSocketConnectionClosedException:
             print("WS closed, reconnecting in 3s...")
             time.sleep(3)
         except Exception as e:
             print("WS error:", e)
             time.sleep(5)
-
 
 def start_ws_thread():
     """Стартуем отдельный поток для WebSocket-бота."""
@@ -1439,6 +2078,7 @@ def start_cleanup_thread():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    load_channel_map()
     start_ws_thread()
     start_cleanup_thread()
     app.run(host="0.0.0.0", port=8000)
