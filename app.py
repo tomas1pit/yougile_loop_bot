@@ -61,7 +61,7 @@ BOT_PUBLIC_URL = os.getenv("BOT_PUBLIC_URL", "").rstrip("/")
 
 YOUGILE_COMPANY_ID = os.getenv("YOUGILE_COMPANY_ID")
 YOUGILE_API_KEY = os.getenv("YOUGILE_API_KEY")
-YOUGILE_BASE_URL = os.getenv("YOUGILE_BASE_URL", "https://yougile.com/api-v2").rstrip("/")
+YOUGILE_BASE_URL = os.getenv("YOUGILE_BASE_URL", "https://ru.yougile.com/api-v2").rstrip("/")
 YOUGILE_TEAM_ID = os.getenv("YOUGILE_TEAM_ID")
 
 # Если явно не указан TEAM_ID, пытаемся получить его из COMPANY_ID
@@ -327,6 +327,20 @@ def parse_create_command(message: str, bot_username: str):
         return None
     return m.group(1).strip()
 
+def extract_selected_value(data):
+    """
+    Унифицированно достаёт value выбранной опции из payload интерактивного экшена Mattermost.
+
+    Возвращает строку (value) или None, если ничего не выбрано.
+    """
+    ctx = data.get("context") or {}
+    raw = ctx.get("selected_option") or (data.get("data") or {}).get("selected_option")
+
+    # Mattermost может присылать selected_option как dict {"text": "...", "value": "..."}
+    # или сразу строкой.
+    if isinstance(raw, dict):
+        return raw.get("value")
+    return raw
 
 # ---------------------------------------------------------------------------
 #  Обёртки над YouGile API (проекты / доски / задачи / чат / файлы)
@@ -366,20 +380,27 @@ def yg_get_columns(board_id):
     return data.get("content", [])
 
 
-def yg_get_project_users(project_id):
-    """GET /users?projectId=... — список пользователей проекта."""
+def yg_get_project_users(project_id=None):
+    """
+    GET /users?projectId=... — список пользователей проекта
+    или GET /users — список всех пользователей компании (если project_id не задан).
+    """
+    params = {"projectId": project_id} if project_id else None
+
     r = requests.get(
         f"{YOUGILE_BASE_URL}/users",
         headers=yg_headers,
-        params={"projectId": project_id},
+        params=params,
         timeout=10
     )
     r.raise_for_status()
     data = r.json()
+
     if isinstance(data, dict):
         return data.get("content", [])
     if isinstance(data, list):
         return data
+
     print("DEBUG yg_get_project_users unexpected type:", type(data), data)
     return []
 
@@ -522,6 +543,12 @@ def yg_upload_file(file_bytes, filename, mimetype="application/octet-stream"):
 def get_allowed_projects_for_mm_user(user_id):
     """
     Возвращает список проектов YouGile, к которым у пользователя Loop есть доступ (по email).
+
+    Логика:
+    1) Берём email пользователя из Loop.
+    2) Один запрос к /users (все пользователи компании) -> строим map user_id -> email.
+    3) Один запрос к /projects -> в каждом проекте поле "users" (userId -> role).
+    4) Для каждого проекта проверяем, есть ли среди users тот, у кого email = email из Loop.
     """
     try:
         mm_user = mm_get_user(user_id)
@@ -530,6 +557,24 @@ def get_allowed_projects_for_mm_user(user_id):
         print("Error fetching MM user for project filter:", e)
         mm_email = ""
 
+    if not mm_email:
+        return []
+
+    # 1) Все пользователи компании: id -> email
+    try:
+        all_users = yg_get_project_users(None)  # вызов без projectId -> /users (все пользователи)
+    except Exception as e:
+        print("Error fetching YouGile users:", e)
+        all_users = []
+
+    user_email_by_id = {}
+    for u in all_users:
+        uid = u.get("id")
+        email = (u.get("email") or "").strip().lower()
+        if uid and email:
+            user_email_by_id[uid] = email
+
+    # 2) Все проекты
     try:
         all_projects = yg_get_projects()
     except Exception as e:
@@ -537,22 +582,22 @@ def get_allowed_projects_for_mm_user(user_id):
         all_projects = []
 
     allowed_projects = []
-    if mm_email:
-        for p in all_projects:
-            project_id = p.get("id")
-            if not project_id:
-                continue
-            try:
-                users = yg_get_project_users(project_id)
-            except Exception as e:
-                print(f"Error fetching users for project {project_id}:", e)
-                continue
 
-            for u in users:
-                u_email = (u.get("email") or "").strip().lower()
-                if u_email and u_email == mm_email:
-                    allowed_projects.append(p)
-                    break
+    for p in all_projects:
+        # опционально можно сразу отфильтровать удалённые проекты
+        if p.get("deleted"):
+            continue
+
+        users_map = p.get("users") or {}
+        if not isinstance(users_map, dict):
+            continue
+
+        # users_map: { userId: "roleId" / "worker" / ... }
+        for user_id_in_project in users_map.keys():
+            email = user_email_by_id.get(user_id_in_project)
+            if email and email == mm_email:
+                allowed_projects.append(p)
+                break  # этот проект уже добавлен, дальше юзеров не смотрим
 
     return allowed_projects
 
@@ -581,10 +626,91 @@ def calc_deadline(choice: str) -> date:
     # fallback: сегодня
     return today
 
+def format_deadline(choice: str, deadline: date | None, raw_display: str | None = None):
+    """
+    Преобразует внутренние значения дедлайна в:
+    - deadline_human: человекочитаемое значение ("Сегодня", "Через неделю", "Без дедлайна", "2025-11-13", ...)
+    - deadline_str: финальная строка для summary, вида "<human> (DD.MM.YYYY)" или "без дедлайна"
+    """
+    choice = (choice or "").lower()
+
+    if choice == "none":
+        deadline_human = "Без дедлайна"
+    elif choice == "today":
+        deadline_human = "Сегодня"
+    elif choice == "tomorrow":
+        deadline_human = "Завтра"
+    elif choice == "day_after_tomorrow":
+        deadline_human = "Послезавтра"
+    elif choice == "week":
+        deadline_human = "Через неделю"
+    elif choice == "month":
+        deadline_human = "Через месяц"
+    elif choice == "custom" and raw_display:
+        # Показываем ровно то, что ввёл пользователь
+        deadline_human = raw_display
+    elif deadline:
+        deadline_human = deadline.strftime("%d.%m.%Y")
+    else:
+        deadline_human = "без дедлайна"
+
+    if deadline:
+        date_str = deadline.strftime("%d.%m.%Y")
+        deadline_str = f"{deadline_human} ({date_str})"
+    else:
+        deadline_str = deadline_human or "без дедлайна"
+
+    return deadline_human, deadline_str
+
 
 # ---------------------------------------------------------------------------
 #  Построение интерактивных сообщений (attachments) для шагов мастера
 # ---------------------------------------------------------------------------
+
+def build_task_summary(task_title, project_title, board_title, assignee_name, deadline_str, task_url=None):
+    """
+    Строит единообразное summary задачи:
+    Задача "<title>" создана в проекте: <project>, доска: <board>, 
+    ответственный: <assignee>, дедлайн: <deadline>.
+    + при наличии добавляет ссылку.
+    """
+    summary = (
+        f'Задача "{task_title}" создана в проекте: {project_title}, '
+        f'доска: {board_title}, ответственный: {assignee_name}, '
+        f'дедлайн: {deadline_str}.'
+    )
+    if task_url:
+        summary += f"\nСсылка: {task_url}"
+    return summary
+
+def send_task_summary(channel_id, root_post_id, summary, *, to_channel=False, auto=False):
+    """
+    Унифицированная отправка summary:
+    - всегда пишет summary в тред (root_post_id),
+    - опционально дублирует summary в общий канал (to_channel=True),
+    - для автозавершения добавляет тех. сообщение "(Автозавершение диалога)" (auto=True).
+    """
+    # 1) В тред
+    mm_post(
+        channel_id,
+        message=summary,
+        root_id=root_post_id
+    )
+
+    # 2) В общий чат (дополнительный пост без root_id)
+    if to_channel:
+        mm_post(
+            channel_id,
+            message=summary
+        )
+
+    # 3) Техническое сообщение при автозавершении
+    if auto:
+        mm_post(
+            channel_id,
+            message="(Автозавершение диалога)",
+            root_id=root_post_id
+        )
 
 def add_cancel_action(actions, task_title, root_post_id, user_id):
     """
@@ -1065,11 +1191,7 @@ def mm_actions():
             return "", 200
 
         elif step == "MENU_DEFAULT_PROJECT_SET":
-            selected = (data.get("context") or {}).get("selected_option") or (data.get("data") or {}).get("selected_option")
-            if isinstance(selected, dict):
-                project_id = selected.get("value")
-            else:
-                project_id = selected
+            project_id = extract_selected_value(data)
             if not project_id:
                 return "", 200
 
@@ -1124,7 +1246,7 @@ def mm_actions():
             }
 
             # сохраняем state, чтобы потом по id получить title
-            st = set_state(user_id, root_post_id, {
+            set_state(user_id, root_post_id, {
                 "step": "DEFAULT_PROJECT_SELECT",
                 "channel_id": channel_id,
                 "project_options": project_options,
@@ -1165,12 +1287,7 @@ def mm_actions():
             return "", 200
 
         elif step == "DEFAULT_PROJECT_SET":
-            # выбираем проект по умолчанию для чата
-            selected = (data.get("context") or {}).get("selected_option") or (data.get("data") or {}).get("selected_option")
-            if isinstance(selected, dict):
-                project_id = selected.get("value")
-            else:
-                project_id = selected
+            project_id = extract_selected_value(data)
             if not project_id:
                 return "", 200
 
@@ -1191,11 +1308,7 @@ def mm_actions():
         
         # ---------- ВЫБОР ПРОЕКТА (через select) ----------
         elif step == "CHOOSE_PROJECT":
-            selected = (data.get("context") or {}).get("selected_option") or (data.get("data") or {}).get("selected_option")
-            if isinstance(selected, dict):
-                project_id = selected.get("value")
-            else:
-                project_id = selected
+            project_id = extract_selected_value(data)
             if not project_id:
                 return "", 200
 
@@ -1277,11 +1390,7 @@ def mm_actions():
 
         # ---------- ВЫБОР ДОСКИ ----------
         elif step == "CHOOSE_BOARD":
-            selected = (data.get("context") or {}).get("selected_option") or (data.get("data") or {}).get("selected_option")
-            if isinstance(selected, dict):
-                board_id = selected.get("value")
-            else:
-                board_id = selected
+            board_id = extract_selected_value(data)
             if not board_id:
                 return "", 200
 
@@ -1329,11 +1438,7 @@ def mm_actions():
 
         # ---------- ВЫБОР КОЛОНКИ ----------
         elif step == "CHOOSE_COLUMN":
-            selected = (data.get("context") or {}).get("selected_option") or (data.get("data") or {}).get("selected_option")
-            if isinstance(selected, dict):
-                column_id = selected.get("value")
-            else:
-                column_id = selected
+            column_id = extract_selected_value(data)
             if not column_id:
                 return "", 200
 
@@ -1373,11 +1478,7 @@ def mm_actions():
 
         # ---------- ВЫБОР ИСПОЛНИТЕЛЯ ----------
         elif step == "CHOOSE_ASSIGNEE":
-            selected = (data.get("context") or {}).get("selected_option") or (data.get("data") or {}).get("selected_option")
-            if isinstance(selected, dict):
-                assignee_id = selected.get("value")
-            else:
-                assignee_id = selected
+            assignee_id = extract_selected_value(data)
             if not assignee_id:
                 return "", 200
 
@@ -1499,25 +1600,22 @@ def mm_actions():
             task_url = st.get("task_url", "")
             channel_id_state = st.get("channel_id", channel_id)
 
-            summary = (
-                f'Задача "{task_title}" создана в проекте: {project_title}, '
-                f'доска: {board_title}, ответственный: {assignee_name}, '
-                f'дедлайн: {deadline_str}.'
-            )
-            if task_url:
-                summary += f"\nСсылка: {task_url}"
-
-            # 1) В тред
-            mm_post(
-                channel_id_state,
-                message=summary,
-                root_id=root_post_id
+            summary = build_task_summary(
+                task_title=task_title,
+                project_title=project_title,
+                board_title=board_title,
+                assignee_name=assignee_name,
+                deadline_str=deadline_str,
+                task_url=task_url,
             )
 
-            # 2) Отдельным постом в канал (общий чат)
-            mm_post(
+            # summary → в тред + в общий канал
+            send_task_summary(
                 channel_id_state,
-                message=summary
+                root_post_id,
+                summary,
+                to_channel=True,
+                auto=False,
             )
 
             # 3) Обновляем интерактивный пост
@@ -1596,39 +1694,14 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
     else:
         task_url = "https://ru.yougile.com/"
 
-    # --- Человекочитаемый дедлайн для отображения ---
     deadline_choice = state.get("deadline_choice")
     deadline_display = state.get("deadline_display")
 
-    if deadline_choice == "none":
-        deadline_human = "Без дедлайна"
-    elif deadline_choice == "today":
-        deadline_human = "Сегодня"
-    elif deadline_choice == "tomorrow":
-        deadline_human = "Завтра"
-    elif deadline_choice == "day_after_tomorrow":
-        deadline_human = "Послезавтра"
-    elif deadline_choice == "week":
-        deadline_human = "Через неделю"
-    elif deadline_choice == "month":
-        deadline_human = "Через месяц"
-    elif deadline_choice == "custom" and deadline_display:
-        # Показываем ровно то, что ввёл пользователь
-        deadline_human = deadline_display
-    elif deadline:
-        deadline_human = deadline.strftime("%d.%m.%Y")
-    else:
-        deadline_human = "без дедлайна"
-
-    # DD.MM.YYYY в скобках, если у нас вообще есть конкретная дата
-    if deadline:
-        deadline_date_str = deadline.strftime("%d.%m.%Y")
-        deadline_suffix = f" ({deadline_date_str})"
-    else:
-        deadline_suffix = ""
-
-    # Для итогового summary будем использовать именно этот текст
-    deadline_str = f"{deadline_human}{deadline_suffix}".strip() or "без дедлайна"
+    deadline_human, deadline_str = format_deadline(
+        deadline_choice,
+        deadline,
+        deadline_display,
+    )
 
     meta = {
         "yougile_task_id": task_id,
@@ -1642,7 +1715,7 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
     #    ВАЖНО: attachments убираем — на этом сообщении больше ничего интерактивного не нужно.
     mm_patch_post(
         post_id,
-        message=f'Дедлайн для задачи "{task_title}": {deadline_human}{deadline_suffix}.',
+        message=f'Дедлайн для задачи "{task_title}": {deadline_str}.',
         attachments=[]
     )
 
@@ -1693,24 +1766,22 @@ def auto_finish_dialog(user_id, root_post_id):
     if not channel_id_state:
         return
 
-    summary = (
-        f'Задача "{task_title}" создана в проекте: {project_title}, '
-        f'доска: {board_title}, ответственный: {assignee_name}, '
-        f'дедлайн: {deadline_str}.'
+    summary = build_task_summary(
+        task_title=task_title,
+        project_title=project_title,
+        board_title=board_title,
+        assignee_name=assignee_name,
+        deadline_str=deadline_str,
+        task_url=task_url,
     )
-    if task_url:
-        summary += f"\nСсылка: {task_url}"
 
-    mm_post(
+    # summary → только в тред + "(Автозавершение диалога)"
+    send_task_summary(
         channel_id_state,
-        message=summary,
-        root_id=root_post_id
-    )
-
-    mm_post(
-        channel_id_state, 
-        message="(Автозавершение диалога)", 
-        root_id=root_post_id
+        root_post_id,
+        summary,
+        to_channel=False,
+        auto=True,
     )
 
     clear_state(user_id, root_post_id)
