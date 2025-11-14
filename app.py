@@ -257,6 +257,34 @@ def mm_patch_post(post_id, message=None, attachments=None):
     r.raise_for_status()
     return r.json()
 
+def mm_post_ephemeral(user_id, channel_id, message, attachments=None, root_id=None):
+    """
+    Отправить ephemeral-сообщение (видно только одному пользователю).
+    """
+    post = {
+        "channel_id": channel_id,
+        "message": message,
+    }
+    if root_id:
+        post["root_id"] = root_id
+    if attachments:
+        post.setdefault("props", {})
+        post["props"]["attachments"] = attachments
+
+    payload = {
+        "user_id": user_id,
+        "post": post,
+    }
+
+    r = requests.post(
+        f"{MM_URL}/api/v4/posts/ephemeral",
+        headers=mm_headers,
+        json=payload,
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
+
 def mm_add_reaction(user_id, post_id, emoji_name):
     """Поставить реакцию на сообщение в Loop (Mattermost) от имени бота."""
     bot_id = get_bot_user_id()
@@ -1132,6 +1160,8 @@ def mm_actions():
             })
 
             options = [
+                {"text": "Не выбирать проект автоматически", "value": "__none__"},
+            ] + [
                 {"text": title, "value": pid}
                 for pid, title in project_options.items()
             ]
@@ -1195,6 +1225,17 @@ def mm_actions():
             if not project_id:
                 return "", 200
 
+            if project_id == "__none__":
+                # очищаем маппинг
+                delete_default_project_for_channel(channel_id)
+                mm_patch_post(
+                    post_id,
+                    message="Проект по умолчанию для этого чата отключён. Буду спрашивать проект при создании задач.",
+                    attachments=[]
+                )
+                clear_state(user_id, root_post_id)
+                return "", 200
+
             st = get_state(user_id, root_post_id) or {}
             project_options = st.get("project_options", {})
             project_title = project_options.get(project_id, "без названия")
@@ -1221,10 +1262,11 @@ def mm_actions():
         
         # ---------- ВОПРОС ПРО ПРОЕКТ ПО УМОЛЧАНИЮ (ПРИ ДОБАВЛЕНИИ В КАНАЛ) ----------
         elif step == "DEFAULT_PROJECT_PROMPT_NO":
-            mm_post(
-                channel_id,
+            # было mm_post(...)
+            mm_patch_post(
+                post_id,
                 message="Ок, проект по умолчанию для этого чата не установлен. Буду спрашивать проект при создании задач.",
-                root_id=root_post_id
+                attachments=[]  # выключаем кнопки
             )
             return "", 200
 
@@ -1245,15 +1287,16 @@ def mm_actions():
                 if p.get("id")
             }
 
-            # сохраняем state, чтобы потом по id получить title
             set_state(user_id, root_post_id, {
                 "step": "DEFAULT_PROJECT_SELECT",
                 "channel_id": channel_id,
                 "project_options": project_options,
             })
 
-            # строим select из проектов
+            # --- ВСТАВЛЯЕМ опцию "Не выбирать проект автоматически" ПЕРВОЙ ---
             options = [
+                {"text": "Не выбирать проект автоматически", "value": "__none__"},
+            ] + [
                 {"text": title, "value": pid}
                 for pid, title in project_options.items()
             ]
@@ -1277,11 +1320,11 @@ def mm_actions():
                 "actions": [select_action]
             }]
 
-            mm_post(
-                channel_id,
+            # ВАЖНО: обновляем ИСХОДНОЕ ephemeral, НЕ создаём новое сообщение
+            mm_patch_post(
+                post_id,
                 message="Проект по умолчанию:",
-                attachments=attachments,
-                root_id=root_post_id
+                attachments=attachments
             )
 
             return "", 200
@@ -1291,16 +1334,26 @@ def mm_actions():
             if not project_id:
                 return "", 200
 
+            if project_id == "__none__":
+                delete_default_project_for_channel(channel_id)
+                mm_patch_post(
+                    post_id,
+                    message="Проект по умолчанию для этого чата не будет выбран автоматически. Буду спрашивать проект при создании задач.",
+                    attachments=[]
+                )
+                clear_state(user_id, root_post_id)
+                return "", 200
+
             st = get_state(user_id, root_post_id) or {}
             project_options = st.get("project_options", {})
             project_title = project_options.get(project_id, "без названия")
 
             set_default_project_for_channel(channel_id, project_id, project_title)
 
-            mm_post(
-                channel_id,
+            mm_patch_post(
+                post_id,
                 message=f'Проект по умолчанию для этого чата установлен: {project_title}',
-                root_id=root_post_id
+                attachments=[]
             )
 
             clear_state(user_id, root_post_id)
@@ -1981,6 +2034,8 @@ def run_ws_bot():
                 # Бота ДОБАВИЛИ в канал → спросить про проект по умолчанию
                 if post_type == "system_add_to_channel":
                     added_user_id = props.get("addedUserId")
+                    # кто добавил бота
+                    adder_user_id = props.get("userId") or props.get("user_id")
                     if bot_id and added_user_id == bot_id and channel_id:
                         prompt = (
                             "Я только что добавлен в этот канал.\n"
@@ -2015,13 +2070,23 @@ def run_ws_bot():
                             ]
                         }]
 
-                        mm_post(
-                            channel_id,
-                            message=prompt,
-                            attachments=attachments,
-                            root_id=None
-                        )
-                    # системный пост дальше нам не нужен
+                        # если знаем, кто добавил — шлём ephemeral именно ему
+                        if adder_user_id:
+                            mm_post_ephemeral(
+                                adder_user_id,
+                                channel_id,
+                                message=prompt,
+                                attachments=attachments,
+                                root_id=None
+                            )
+                        else:
+                            # fallback — обычное сообщение в канал
+                            mm_post(
+                                channel_id,
+                                message=prompt,
+                                attachments=attachments,
+                                root_id=None
+                            )
                     continue
 
                 # Бота УДАЛИЛИ из канала → чистим мэппинг
