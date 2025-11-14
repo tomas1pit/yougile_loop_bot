@@ -1958,19 +1958,30 @@ def run_ws_bot():
                     continue
 
                 event = data.get("event")
-
-                # Лог всех событий для дебага
                 if event:
                     print("WS event:", event, "data:", data.get("data", {}))
 
-                # --- Бота добавили в канал: спрашиваем про проект по умолчанию ---
-                if event in ("user_added_to_channel", "added_to_channel", "user_added"):
-                    ev = data.get("data", {}) or {}
-                    channel_id_ev = ev.get("channel_id")
-                    added_user_id = ev.get("user_id")
-                    bot_id = get_bot_user_id()
+                # --- Обрабатываем только posted ---
+                if event != "posted":
+                    continue
 
-                    if bot_id and added_user_id == bot_id and channel_id_ev:
+                post = decode_mm_post_from_event(data)
+                if not post:
+                    continue
+
+                post_type = post.get("type") or ""
+                props = post.get("props") or {}
+                channel_id = post.get("channel_id")
+                user_id = post.get("user_id")
+                message = post.get("message", "")
+                root_id = post.get("root_id") or post.get("id")
+                bot_id = get_bot_user_id()
+
+                # ---------- 0) Системные события добавления/удаления бота из канала ----------
+                # Бота ДОБАВИЛИ в канал → спросить про проект по умолчанию
+                if post_type == "system_add_to_channel":
+                    added_user_id = props.get("addedUserId")
+                    if bot_id and added_user_id == bot_id and channel_id:
                         prompt = (
                             "Я только что добавлен в этот канал.\n"
                             "Хотите установить проект по умолчанию для этого чата?"
@@ -2005,43 +2016,24 @@ def run_ws_bot():
                         }]
 
                         mm_post(
-                            channel_id_ev,
+                            channel_id,
                             message=prompt,
                             attachments=attachments,
                             root_id=None
                         )
+                    # системный пост дальше нам не нужен
                     continue
 
-                # --- Бота удалили из канала: чистим меппинг ---
-                if event in ("user_removed_from_channel", "leave_channel", "user_removed"):
-                    ev = data.get("data", {}) or {}
-                    channel_id_ev = ev.get("channel_id")
-
-                    # id именно удалённого пользователя
-                    user_id_ev = ev.get("user_id") or ev.get("removed_user_id")
-                    bot_id = get_bot_user_id()
-
-                    if bot_id and user_id_ev == bot_id and channel_id_ev:
-                        print(f"Bot removed from channel {channel_id_ev}, deleting default project mapping")
-                        delete_default_project_for_channel(channel_id_ev)
-
+                # Бота УДАЛИЛИ из канала → чистим мэппинг
+                if post_type == "system_remove_from_channel":
+                    removed_user_id = props.get("removedUserId")
+                    if bot_id and removed_user_id == bot_id and channel_id:
+                        print(f"Bot removed from channel {channel_id}, deleting default project mapping")
+                        delete_default_project_for_channel(channel_id)
                     continue
-
-                # Нас интересуют только обычные сообщения
-                if event != "posted":
-                    continue
-
-                post = decode_mm_post_from_event(data)
-                if not post:
-                    continue
-
-                channel_id = post.get("channel_id")
-                user_id = post.get("user_id")
-                message = post.get("message", "")
-                root_id = post.get("root_id") or post.get("id")
 
                 # ---------- 1) Старт диалога: упоминание бота ----------
-                if f"@{MM_BOT_USERNAME}" in message.lower():
+                if f"@{MM_BOT_USERNAME}" in (message or "").lower():
                     title = parse_create_command(message, MM_BOT_USERNAME)
 
                     if title:
@@ -2062,7 +2054,7 @@ def run_ws_bot():
                 # ---------- 2) Ожидание кастомной даты дедлайна ----------
                 st = get_state(user_id, root_id)
                 if st and st.get("step") == "CHOOSE_DEADLINE" and st.get("deadline_choice") == "custom":
-                    text = message.strip()
+                    text = (message or "").strip()
                     if text:
                         try:
                             d = datetime.strptime(text, "%Y-%m-%d").date()
@@ -2079,7 +2071,7 @@ def run_ws_bot():
 
                         st = set_state(user_id, root_id, {
                             "deadline": d,
-                            "deadline_display": text,
+                            "deadline_display": text,  # запоминаем, что ввёл пользователь
                         })
                         task_title = st.get("task_title", "Без названия")
 
