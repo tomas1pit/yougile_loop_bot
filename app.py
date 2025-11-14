@@ -1926,7 +1926,6 @@ def start_task_creation(user_id, channel_id, root_id, title):
 # ---------------------------------------------------------------------------
 
 def run_ws_bot():
-    print("WS event:", event, "data:", data.get("data", {}))
     """Подключение к WebSocket и обработка событий posted."""
     ws_url = MM_URL.replace("https", "wss").replace("http", "ws") + "/api/v4/websocket"
     seq = 1
@@ -1960,8 +1959,12 @@ def run_ws_bot():
 
                 event = data.get("event")
 
+                # Лог всех событий для дебага
+                if event:
+                    print("WS event:", event, "data:", data.get("data", {}))
+
                 # --- Бота добавили в канал: спрашиваем про проект по умолчанию ---
-                if event in ("user_added_to_channel", "added_to_channel"):
+                if event in ("user_added_to_channel", "added_to_channel", "user_added"):
                     ev = data.get("data", {}) or {}
                     channel_id_ev = ev.get("channel_id")
                     added_user_id = ev.get("user_id")
@@ -2019,10 +2022,12 @@ def run_ws_bot():
                     bot_id = get_bot_user_id()
 
                     if bot_id and user_id_ev == bot_id and channel_id_ev:
+                        print(f"Bot removed from channel {channel_id_ev}, deleting default project mapping")
                         delete_default_project_for_channel(channel_id_ev)
 
                     continue
 
+                # Нас интересуют только обычные сообщения
                 if event != "posted":
                     continue
 
@@ -2074,7 +2079,7 @@ def run_ws_bot():
 
                         st = set_state(user_id, root_id, {
                             "deadline": d,
-                            "deadline_display": text,  # <-- запомним ровно то, что ввёл пользователь
+                            "deadline_display": text,
                         })
                         task_title = st.get("task_title", "Без названия")
 
@@ -2098,24 +2103,21 @@ def run_ws_bot():
                     if not title_text:
                         continue
 
-                    # сохраняем название
                     st = set_state(user_id, root_id, {
                         "task_title": title_text
                     })
 
-                    # патчим исходное сообщение "Пожалуйста, введите название..."
                     ask_post_id = st.get("ask_title_post_id")
                     if ask_post_id:
                         try:
                             mm_patch_post(
                                 ask_post_id,
                                 message=f'Создаём задачу "{title_text}"',
-                                attachments=[]  # убираем кнопку "Отменить"
+                                attachments=[]
                             )
                         except Exception as e:
                             print("Error patching ask_title_post:", e)
 
-                    # запускаем мастер создания задачи
                     start_task_creation(user_id, channel_id, root_id, title_text)
                     continue
 
@@ -2143,7 +2145,7 @@ def run_ws_bot():
                     def prefix_text(text: str) -> str:
                         return f"Пользователь {full_name} (@{username}) написал: {text}"
 
-                    # 3.1. Отправляем прикреплённые файлы (если есть)
+                    # 3.1. Файлы
                     file_ids = post.get("file_ids") or []
                     for fid in file_ids:
                         try:
@@ -2152,10 +2154,7 @@ def run_ws_bot():
                             filename = info.get("name") or info.get("id") or "file"
                             mimetype = info.get("mime_type") or "application/octet-stream"
 
-                            # загружаем файл в YouGile и получаем относительный url
                             yg_file_url = yg_upload_file(file_bytes, filename, mimetype)
-
-                            # формируем текст для чата: /root/#file:/user-data/...
                             file_cmd = f"/root/#file:{yg_file_url}"
                             chat_text = prefix_text(file_cmd)
 
@@ -2164,7 +2163,7 @@ def run_ws_bot():
                         except Exception as e:
                             print("Error sending file to YouGile chat:", e)
 
-                    # 3.2. Отправляем обычный текст, если он есть
+                    # 3.2. Текст
                     text = (message or "").strip()
                     if text:
                         try:
@@ -2174,15 +2173,15 @@ def run_ws_bot():
                         except Exception as e:
                             print("Error sending text comment to YouGile chat:", e)
 
-                    # 3.3. Если хоть что-то удалось отправить — ставим реакцию ✅ в Loop
+                    # 3.3. Ставим реакцию
                     if sent_anything:
                         try:
                             mm_add_reaction(user_id, post.get("id"), "white_check_mark")
                         except Exception as e:
                             print("Error adding MM reaction:", e)
 
-                        # обновляем updated_at, чтобы авто-завершение шло от последнего действия
                         set_state(user_id, root_id, {})
+
         except WebSocketConnectionClosedException:
             print("WS closed, reconnecting in 3s...")
             time.sleep(3)
