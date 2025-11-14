@@ -1926,6 +1926,7 @@ def start_task_creation(user_id, channel_id, root_id, title):
 # ---------------------------------------------------------------------------
 
 def run_ws_bot():
+    print("WS event:", event, "data:", data.get("data", {}))
     """Подключение к WebSocket и обработка событий posted."""
     ws_url = MM_URL.replace("https", "wss").replace("http", "ws") + "/api/v4/websocket"
     seq = 1
@@ -1960,7 +1961,7 @@ def run_ws_bot():
                 event = data.get("event")
 
                 # --- Бота добавили в канал: спрашиваем про проект по умолчанию ---
-                if event == "added_to_channel":
+                if event in ("user_added_to_channel", "added_to_channel"):
                     ev = data.get("data", {}) or {}
                     channel_id_ev = ev.get("channel_id")
                     added_user_id = ev.get("user_id")
@@ -2009,13 +2010,17 @@ def run_ws_bot():
                     continue
 
                 # --- Бота удалили из канала: чистим меппинг ---
-                if event in ("user_removed_from_channel", "leave_channel"):
+                if event in ("user_removed_from_channel", "leave_channel", "user_removed"):
                     ev = data.get("data", {}) or {}
                     channel_id_ev = ev.get("channel_id")
-                    user_id_ev = ev.get("user_id")
+
+                    # id именно удалённого пользователя
+                    user_id_ev = ev.get("user_id") or ev.get("removed_user_id")
                     bot_id = get_bot_user_id()
+
                     if bot_id and user_id_ev == bot_id and channel_id_ev:
                         delete_default_project_for_channel(channel_id_ev)
+
                     continue
 
                 if event != "posted":
