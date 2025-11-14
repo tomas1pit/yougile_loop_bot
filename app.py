@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Mattermost → YouGile бот.
+Loop (Mattermost) → YouGile бот.
 
 Функции:
 - При сообщении вида `@yougile_bot создай задачу <название>`
@@ -11,7 +11,7 @@ Mattermost → YouGile бот.
   - выбор стандартного дедлайна (сегодня / завтра / послезавтра / неделя / месяц),
   - кастомную дату YYYY-MM-DD,
   - необязательный дедлайн ("Без дедлайна"),
-  - дополнение описания задачи текстом из треда,
+  - отправку сообщений и файлов в чат задачи (chatId = taskId) из треда,
   - отмену создания задачи на любом шаге,
   - автозавершение диалога, если пользователь забыл нажать "Завершить".
 """
@@ -64,7 +64,7 @@ YOUGILE_API_KEY = os.getenv("YOUGILE_API_KEY")
 YOUGILE_BASE_URL = os.getenv("YOUGILE_BASE_URL", "https://yougile.com/api-v2").rstrip("/")
 YOUGILE_TEAM_ID = os.getenv("YOUGILE_TEAM_ID")
 
-# Если явно не указан TEAM_ID, пытаемся получить его из COMPANY_ID, как в твоём URL
+# Если явно не указан TEAM_ID, пытаемся получить его из COMPANY_ID
 if not YOUGILE_TEAM_ID and YOUGILE_COMPANY_ID:
     YOUGILE_TEAM_ID = YOUGILE_COMPANY_ID.split("-")[-1]
 
@@ -83,7 +83,6 @@ mm_headers = {
 }
 
 yg_headers = {
-    # вариант с X-Company-Id / X-Api-Key оставляем закомментированным — вдруг пригодится
     # "X-Company-Id": YOUGILE_COMPANY_ID,
     # "X-Api-Key": YOUGILE_API_KEY,
     "Authorization": f"Bearer {YOUGILE_API_KEY}",
@@ -128,11 +127,11 @@ def clear_state(user_id, root_post_id):
 
 
 # ---------------------------------------------------------------------------
-#  Помощники для Mattermost
+#  Помощники для Loop (Mattermost)
 # ---------------------------------------------------------------------------
 
 def mm_get_user(user_id):
-    """Получить данные пользователя Mattermost по user_id."""
+    """Получить данные пользователя по user_id."""
     url = f"{MM_URL}/api/v4/users/{user_id}"
     r = requests.get(url, headers=mm_headers, timeout=10)
     r.raise_for_status()
@@ -141,7 +140,7 @@ def mm_get_user(user_id):
 
 def mm_post(channel_id, message, attachments=None, root_id=None):
     """
-    Создаёт новый пост в Mattermost.
+    Создаёт новый пост в Loop.
     Если указан root_id — пост будет в треде.
     Если переданы attachments — это интерактивные сообщения (кнопки/селекты).
     """
@@ -207,7 +206,7 @@ def parse_create_command(message: str, bot_username: str):
 
 
 # ---------------------------------------------------------------------------
-#  Обёртки над YouGile API
+#  Обёртки над YouGile API (проекты / доски / задачи / чат / файлы)
 # ---------------------------------------------------------------------------
 
 def yg_get_projects():
@@ -262,29 +261,6 @@ def yg_get_project_users(project_id):
     return []
 
 
-def yg_get_task(task_id):
-    """GET /tasks/{id} — полная карточка задачи."""
-    r = requests.get(
-        f"{YOUGILE_BASE_URL}/tasks/{task_id}",
-        headers=yg_headers,
-        timeout=10,
-    )
-    r.raise_for_status()
-    return r.json()
-
-
-def yg_update_task_description(task_id, new_description):
-    """PUT /tasks/{id} — обновить описание задачи."""
-    r = requests.put(
-        f"{YOUGILE_BASE_URL}/tasks/{task_id}",
-        headers=yg_headers,
-        json={"description": new_description},
-        timeout=10,
-    )
-    r.raise_for_status()
-    return r.json()
-
-
 def yg_create_task(title, column_id, description="", assignee_id=None, deadline=None):
     """
     POST /tasks — создать задачу в YouGile.
@@ -326,8 +302,60 @@ def yg_create_task(title, column_id, description="", assignee_id=None, deadline=
         json=body,
         timeout=10,
     )
-    # при отладке можно включить:
-    # print("YG create task status:", r.status_code, "body:", r.text)
+    r.raise_for_status()
+    return r.json()
+
+
+def yg_get_task(task_id):
+    """GET /tasks/{id} — полная карточка задачи (используем только для idTaskProject/idTaskCommon)."""
+    r = requests.get(
+        f"{YOUGILE_BASE_URL}/tasks/{task_id}",
+        headers=yg_headers,
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def yg_send_chat_message(chat_id, text):
+    """
+    Отправка текстового сообщения в чат задачи.
+    chatId = taskId.
+
+    NB: проверь по Swagger точный путь:
+        здесь предполагается POST /chats/{chatId}/messages
+    """
+    body = {"text": text}
+    r = requests.post(
+        f"{YOUGILE_BASE_URL}/chats/{chat_id}/messages",
+        headers=yg_headers,
+        json=body,
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def yg_upload_file(file_bytes, filename, content_type="application/octet-stream"):
+    """
+    Загрузка файла в YouGile.
+
+    NB: путь предполагается /files. Если в Swagger другой (например /files/upload),
+    просто поправь URL ниже.
+    """
+    # Для multipart нельзя жёстко ставить Content-Type, поэтому копируем заголовки без него
+    headers = {k: v for k, v in yg_headers.items() if k.lower() != "content-type"}
+
+    files = {
+        "file": (filename, file_bytes, content_type),
+    }
+
+    r = requests.post(
+        f"{YOUGILE_BASE_URL}/files",
+        headers=headers,
+        files=files,
+        timeout=30,
+    )
     r.raise_for_status()
     return r.json()
 
@@ -573,7 +601,7 @@ def build_finish_buttons(task_title, task_url, user_id, root_post_id, meta):
 
 
 # ---------------------------------------------------------------------------
-#  Flask-приложение (webhook для интерактивных действий Mattermost)
+#  Flask-приложение (webhook для интерактивных действий)
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__)
@@ -588,7 +616,7 @@ def healthz():
 @app.route("/mattermost/actions", methods=["POST"])
 def mm_actions():
     """
-    Обработчик интерактивных действий Mattermost:
+    Обработчик интерактивных действий:
     - выбор проекта / доски / колонки / исполнителя / дедлайна
     - отмена
     - ручное завершение диалога
@@ -601,7 +629,6 @@ def mm_actions():
     post_id = data.get("post_id")
     channel_id = data.get("channel_id")
 
-    # Без этих полей корректно обработать событие не получится — тихо игнорируем
     if not (step and user_id and root_post_id and post_id and channel_id):
         return "", 200
 
@@ -624,7 +651,6 @@ def mm_actions():
 
             boards = yg_get_boards(project_id)
 
-            # Превращаем текущее сообщение в "фикс выбора" без кнопок
             mm_patch_post(
                 post_id,
                 message=f'Проект для задачи "{task_title}": {project_title}',
@@ -640,7 +666,6 @@ def mm_actions():
                 return "", 200
 
             if len(boards) <= 1:
-                # Если в проекте одна доска — сразу идём к выбору колонки
                 board = boards[0]
                 board_id = board["id"]
                 board_title = board.get("title", "без названия")
@@ -664,7 +689,6 @@ def mm_actions():
                     "post_ids": state.get("post_ids", []) + [resp["id"]]
                 })
             else:
-                # Иначе сначала спрашиваем доску
                 attachments = build_board_buttons(
                     task_title, project_id, boards, user_id, root_post_id
                 )
@@ -696,7 +720,6 @@ def mm_actions():
                 task_title, project_id, board_id, columns, user_id, root_post_id
             )
 
-            # Фиксируем выбор доски
             mm_patch_post(
                 post_id,
                 message=f'Доска для задачи "{task_title}": {board_title}',
@@ -763,13 +786,9 @@ def mm_actions():
                 "assignee_id": assignee_id,
             })
 
-            # Значение по умолчанию — id
             assignee_name = assignee_id
-
-            # Вытаскиваем project_id из state
             project_id = state.get("project_id") or context.get("project_id")
 
-            # Пытаемся найти читабельное имя исполнителя
             try:
                 users = yg_get_project_users(project_id)
                 for u in users:
@@ -779,7 +798,6 @@ def mm_actions():
             except Exception as e:
                 print("Error fetching project users:", e)
 
-            # Сохраняем имя исполнителя в состоянии (для финального резюме)
             state = set_state(user_id, root_post_id, {
                 "assignee_name": assignee_name,
             })
@@ -818,7 +836,6 @@ def mm_actions():
             })
 
             if deadline_choice == "custom":
-                # Ждём ввода даты в тред
                 mm_patch_post(
                     post_id,
                     message=(
@@ -828,11 +845,9 @@ def mm_actions():
                     attachments=[]
                 )
             elif deadline_choice == "none":
-                # Без дедлайна
                 state = set_state(user_id, root_post_id, {"deadline": None})
                 create_task_and_update_post(task_title, state, user_id, post_id)
             else:
-                # Стандартные варианты: сегодня / завтра / ...
                 deadline_date = calc_deadline(deadline_choice)
                 state = set_state(user_id, root_post_id, {"deadline": deadline_date})
                 create_task_and_update_post(task_title, state, user_id, post_id)
@@ -843,7 +858,6 @@ def mm_actions():
             channel_id_state = state.get("channel_id", channel_id)
             post_ids = state.get("post_ids", [])
 
-            # Удаляем все посты бота в этом треде
             for pid in post_ids:
                 try:
                     requests.delete(
@@ -886,20 +900,17 @@ def mm_actions():
             if task_url:
                 summary += f"\nСсылка: {task_url}"
 
-            # Сообщение в треде
             mm_post(
                 channel_id_state,
                 message=summary,
                 root_id=root_post_id
             )
 
-            # И дублируем в канал (отдельным постом)
             mm_post(
                 channel_id_state,
                 message=summary
             )
 
-            # Подчищаем сообщение с кнопкой
             mm_patch_post(
                 post_id,
                 message=f'Диалог по задаче "{task_title}" завершён.',
@@ -925,10 +936,9 @@ def mm_actions():
 def create_task_and_update_post(task_title, state, user_id, post_id):
     """
     Создаёт задачу в YouGile на основе state и обновляет сообщение
-    в Mattermost (там, где были кнопки дедлайна) на "✅ Задача создана".
+    в Loop (там, где были кнопки дедлайна) на "✅ Задача создана".
     Также записывает всё нужное для финального резюме (FINISH / автозавершение).
     """
-    # Автор в описании — FirstName LastName из Mattermost
     mm_user = mm_get_user(user_id)
     first_name = mm_user.get("first_name", "").strip()
     last_name = mm_user.get("last_name", "").strip()
@@ -941,7 +951,6 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
 
     description = f"Создано из Loop пользователем {full_name} (@{username})"
 
-    # создаём задачу
     task = yg_create_task(
         task_title,
         column_id,
@@ -951,7 +960,6 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
     )
     task_id = task.get("id")
 
-    # пробуем вытащить idTaskProject / idTaskCommon
     task_project_id = task.get("idTaskProject") or task.get("idTaskCommon")
     try:
         if task_id and not task_project_id:
@@ -960,7 +968,6 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
     except Exception as e:
         print("Error fetching full YouGile task:", e)
 
-    # "Красивый" URL
     project_title = state.get("project_title")
     project_slug = slugify_title(project_title) if project_title else ""
     team_id = YOUGILE_TEAM_ID or YOUGILE_COMPANY_ID
@@ -972,7 +979,6 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
     else:
         task_url = "https://ru.yougile.com/"
 
-    # человекочитаемый дедлайн
     if deadline:
         deadline_str = deadline.strftime("%d.%m.%Y")
     else:
@@ -983,7 +989,6 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
     }
     attachments = build_finish_buttons(task_title, task_url, user_id, state.get("root_post_id"), meta)
 
-    # Обновляем пост с выбором дедлайна
     mm_patch_post(
         post_id,
         message=(
@@ -994,7 +999,6 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
         attachments=attachments
     )
 
-    # Сохраняем всё нужное, чтобы потом красиво завершить диалог
     set_state(user_id, state.get("root_post_id"), {
         "step": "OPTIONAL_ATTACH",
         "yougile_task_id": task_id,
@@ -1031,14 +1035,12 @@ def auto_finish_dialog(user_id, root_post_id):
     if task_url:
         summary += f"\nСсылка: {task_url}"
 
-    # Сообщение в тред
     mm_post(
         channel_id_state,
         message=summary,
         root_id=root_post_id
     )
 
-    # И дублируем в канал с пометкой "Автозавершение"
     mm_post(
         channel_id_state,
         message=f"(Автозавершение) {summary}"
@@ -1048,11 +1050,11 @@ def auto_finish_dialog(user_id, root_post_id):
 
 
 # ---------------------------------------------------------------------------
-#  WebSocket-бот Mattermost
+#  WebSocket-бот Loop (Mattermost)
 # ---------------------------------------------------------------------------
 
 def run_ws_bot():
-    """Подключение к Mattermost WebSocket и обработка событий posted."""
+    """Подключение к WebSocket и обработка событий posted."""
     ws_url = MM_URL.replace("https", "wss").replace("http", "ws") + "/api/v4/websocket"
     seq = 1
 
@@ -1061,7 +1063,6 @@ def run_ws_bot():
             print(f"Connecting to Mattermost WS {ws_url}")
             ws = create_connection(ws_url)
 
-            # Аутентифицируемся токеном бота
             auth_msg = {
                 "seq": seq,
                 "action": "authentication_challenge",
@@ -1079,7 +1080,6 @@ def run_ws_bot():
                     continue
                 data = json.loads(msg)
 
-                # Нас интересуют только события "posted"
                 if data.get("event") != "posted":
                     continue
 
@@ -1096,7 +1096,6 @@ def run_ws_bot():
                 if f"@{MM_BOT_USERNAME}" in message.lower():
                     title = parse_create_command(message, MM_BOT_USERNAME)
 
-                    # Если команда непонятна — показываем хелп
                     if not title:
                         help_text = (
                             ":huh: Привет!\n"
@@ -1112,7 +1111,6 @@ def run_ws_bot():
                         )
                         continue
 
-                    # Команда корректна — запускаем мастер
                     projects = yg_get_projects()
                     with STATE_LOCK:
                         STATE[(user_id, root_id)] = {
@@ -1120,7 +1118,7 @@ def run_ws_bot():
                             "task_title": title,
                             "root_post_id": root_id,
                             "channel_id": channel_id,
-                            "post_ids": [],   # список постов бота в треде
+                            "post_ids": [],
                         }
 
                     attachments = build_project_buttons(title, projects, user_id, root_id)
@@ -1141,7 +1139,6 @@ def run_ws_bot():
                     text = message.strip()
                     if text:
                         try:
-                            # Ждём формат YYYY-MM-DD
                             d = datetime.strptime(text, "%Y-%m-%d").date()
                         except ValueError:
                             mm_post(
@@ -1154,19 +1151,15 @@ def run_ws_bot():
                             )
                             continue
 
-                        # Дата распарсилась — сохраняем дедлайн
                         st = set_state(user_id, root_id, {"deadline": d})
                         task_title = st.get("task_title", "Без названия")
 
-                        # Берём последний пост бота в этом диалоге
                         post_ids = st.get("post_ids") or []
                         target_post_id = post_ids[-1] if post_ids else None
 
                         if target_post_id:
-                            # Обновляем последний бот-пост (тот, где были кнопки дедлайна)
                             create_task_and_update_post(task_title, st, user_id, target_post_id)
                         else:
-                            # fallback — если по какой-то причине нет post_ids
                             mm_post(
                                 channel_id,
                                 message=f'✅ Задача "{task_title}" создана (кастомный дедлайн).',
@@ -1174,29 +1167,59 @@ def run_ws_bot():
                             )
                         continue
 
-                # ---------- 3) Дополнительные комментарии после создания задачи ----------
+                # ---------- 3) Дополнительные сообщения/файлы после создания задачи ----------
                 st = get_state(user_id, root_id)
                 if st and st.get("step") == "OPTIONAL_ATTACH":
                     task_id = st.get("yougile_task_id")
-                    if message.strip():
-                        try:
-                            task = yg_get_task(task_id)
-                            old_desc = task.get("description") or ""
-                            ts = datetime.now().strftime("%d.%m.%Y %H:%М")
-                            # Если описания нет — просто пишем текст;
-                            # если есть — вставляем два <br> перед блоком
-                            if old_desc:
-                                new_desc = (
-                                    f"{old_desc}<br><br>"
-                                    f"Дополнено {ts}:<br>{message}"
+                    if not task_id:
+                        continue
+
+                    chat_id = task_id
+                    text = message.strip()
+                    file_ids = post.get("file_ids") or []
+
+                    try:
+                        # Текст в чат задачи
+                        if text:
+                            yg_send_chat_message(chat_id, text)
+
+                        # Файлы из Loop → YouGile + сообщение /root/#file:<url>
+                        for fid in file_ids:
+                            try:
+                                meta_resp = requests.get(
+                                    f"{MM_URL}/api/v4/files/{fid}",
+                                    headers=mm_headers,
+                                    timeout=10,
                                 )
-                            else:
-                                new_desc = f"Дополнено {ts}:<br>{message}"
-                            yg_update_task_description(task_id, new_desc)
-                            # Обновляем updated_at для авто-завершения
-                            set_state(user_id, root_id, {})
-                        except Exception as e:
-                            print("Error updating description in YouGile:", e)
+                                meta_resp.raise_for_status()
+                                meta = meta_resp.json()
+                                filename = meta.get("name") or meta.get("filename") or fid
+                                mime_type = meta.get("mime_type") or "application/octet-stream"
+
+                                file_resp = requests.get(
+                                    f"{MM_URL}/api/v4/files/{fid}/get",
+                                    headers=mm_headers,
+                                    timeout=30,
+                                )
+                                file_resp.raise_for_status()
+                                file_bytes = file_resp.content
+
+                                upload_info = yg_upload_file(file_bytes, filename, mime_type)
+                                file_url = upload_info.get("url")
+
+                                if file_url:
+                                    chat_text = f"/root/#file:{file_url}"
+                                    yg_send_chat_message(chat_id, chat_text)
+                                else:
+                                    print("YG upload: no 'url' in response:", upload_info)
+                            except Exception as fe:
+                                print("Error sending file to YouGile chat:", fe)
+
+                        # Обновляем updated_at для авто-завершения
+                        set_state(user_id, root_id, {})
+
+                    except Exception as e:
+                        print("Error sending message to YouGile chat:", e)
 
         except WebSocketConnectionClosedException:
             print("WS closed, reconnecting in 3s...")
@@ -1227,14 +1250,11 @@ def auto_cleanup_loop():
             with STATE_LOCK:
                 items = list(STATE.items())
             for (user_id, root_post_id), st in items:
-                # Интересуют только стадии, где задача уже создана,
-                # но диалог формально не закрыт
                 if st.get("step") != "OPTIONAL_ATTACH":
                     continue
                 updated_at = st.get("updated_at") or st.get("created_at")
                 if not updated_at:
                     continue
-                # Проверяем таймаут
                 if now - updated_at > AUTO_FINISH_TIMEOUT_MINUTES * 60:
                     print(f"Auto-finishing dialog for user={user_id}, root={root_post_id}")
                     try:
