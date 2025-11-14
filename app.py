@@ -940,11 +940,15 @@ def mm_actions():
                 "step": "ASK_TASK_TITLE",
                 "channel_id": channel_id,
                 "task_title": None,
+                # запоминаем сообщение, где просили ввести название
+                "ask_title_post_id": post_id,
+                # и сразу считаем его служебным, чтобы CANCEL мог удалить
+                "post_ids": [post_id],
             })
 
-            # Кнопка "Отменить" без лишнего текста
+            # Кнопка "Отменить" для этого шага
             attachments = [{
-                "text": "",  # раньше было "Назовите задачу:"
+                "text": "Назовите задачу:",
                 "actions": add_cancel_action([], "Без названия", root_post_id, user_id)
             }]
 
@@ -2018,9 +2022,24 @@ def run_ws_bot():
                     if not title_text:
                         continue
 
-                    set_state(user_id, root_id, {
+                    # сохраняем название
+                    st = set_state(user_id, root_id, {
                         "task_title": title_text
                     })
+
+                    # патчим исходное сообщение "Пожалуйста, введите название..."
+                    ask_post_id = st.get("ask_title_post_id")
+                    if ask_post_id:
+                        try:
+                            mm_patch_post(
+                                ask_post_id,
+                                message=f'Создаём задачу "{title_text}"',
+                                attachments=[]  # убираем кнопку "Отменить"
+                            )
+                        except Exception as e:
+                            print("Error patching ask_title_post:", e)
+
+                    # запускаем мастер создания задачи
                     start_task_creation(user_id, channel_id, root_id, title_text)
                     continue
 
