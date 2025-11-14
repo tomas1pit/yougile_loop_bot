@@ -890,7 +890,7 @@ def build_main_menu_attachments(user_id, root_post_id):
     ]
 
     return [{
-        "text": "Привет! Вот что я умею:",
+        "text": "",  # раньше было "Привет! Вот что я умею:"
         "actions": actions
     }]
 
@@ -943,9 +943,9 @@ def mm_actions():
                 "task_title": None,
             })
 
-            # Кнопка "Отменить" для этого шага
+            # Кнопка "Отменить" без лишнего текста
             attachments = [{
-                "text": "Назовите задачу:",
+                "text": "",  # раньше было "Назовите задачу:"
                 "actions": add_cancel_action([], "Без названия", root_post_id, user_id)
             }]
 
@@ -1442,11 +1442,15 @@ def mm_actions():
                     attachments=[]
                 )
             elif deadline_choice == "none":
-                state = set_state(user_id, root_post_id, {"deadline": None})
+                state = set_state(user_id, root_post_id, {
+                    "deadline": None,
+                })
                 create_task_and_update_post(task_title, state, user_id, post_id)
             else:
                 deadline_date = calc_deadline(deadline_choice)
-                state = set_state(user_id, root_post_id, {"deadline": deadline_date})
+                state = set_state(user_id, root_post_id, {
+                    "deadline": deadline_date,
+                })
                 create_task_and_update_post(task_title, state, user_id, post_id)
 
         # ---------- ОТМЕНА ----------
@@ -1500,17 +1504,20 @@ def mm_actions():
             if task_url:
                 summary += f"\nСсылка: {task_url}"
 
+            # 1) В тред
             mm_post(
                 channel_id_state,
                 message=summary,
                 root_id=root_post_id
             )
 
-            # mm_post(
-            #     channel_id_state,
-            #     message=summary
-            # )
+            # 2) Отдельным постом в канал (общий чат)
+            mm_post(
+                channel_id_state,
+                message=summary
+            )
 
+            # 3) Обновляем интерактивный пост
             mm_patch_post(
                 post_id,
                 message=f'Диалог по задаче "{task_title}" завершён.',
@@ -1518,6 +1525,7 @@ def mm_actions():
             )
 
             clear_state(user_id, root_post_id)
+            return "", 200
 
     except Exception as e:
         print("Error in mm_actions:", e)
@@ -1532,11 +1540,12 @@ def mm_actions():
 # ---------------------------------------------------------------------------
 #  Создание задачи в YouGile + обновление поста с кнопкой "Завершить"
 # ---------------------------------------------------------------------------
-
 def create_task_and_update_post(task_title, state, user_id, post_id):
     """
-    Создаёт задачу в YouGile на основе state и обновляет сообщение
-    в Loop (там, где были кнопки дедлайна) на "✅ Задача создана".
+    Создаёт задачу в YouGile на основе state и:
+    - обновляет исходное сообщение с кнопками дедлайна на
+      "Дедлайн для задачи ...: ...",
+    - отправляет отдельное сообщение "✅ Задача ... создана" с ссылкой.
     Также записывает всё нужное для финального резюме (FINISH / автозавершение).
     """
     mm_user = mm_get_user(user_id)
@@ -1579,33 +1588,66 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
     else:
         task_url = "https://ru.yougile.com/"
 
-    if deadline:
-        deadline_str = deadline.strftime("%d.%m.%Y")
+    # --- Человекочитаемый дедлайн для отображения ---
+    deadline_choice = state.get("deadline_choice")
+    deadline_display = state.get("deadline_display")
+
+    if deadline_choice == "none":
+        deadline_human = "Без дедлайна"
+    elif deadline_choice == "today":
+        deadline_human = "Сегодня"
+    elif deadline_choice == "tomorrow":
+        deadline_human = "Завтра"
+    elif deadline_choice == "day_after_tomorrow":
+        deadline_human = "Послезавтра"
+    elif deadline_choice == "week":
+        deadline_human = "Через неделю"
+    elif deadline_choice == "month":
+        deadline_human = "Через месяц"
+    elif deadline_choice == "custom" and deadline_display:
+        # Показываем ровно то, что ввёл пользователь
+        deadline_human = deadline_display
+    elif deadline:
+        deadline_human = deadline.strftime("%d.%m.%Y")
     else:
-        deadline_str = "без дедлайна"
+        deadline_human = "без дедлайна"
+
+    # Для итогового summary будем использовать именно этот текст
+    deadline_str = deadline_human
 
     meta = {
         "yougile_task_id": task_id,
     }
     attachments = build_finish_buttons(task_title, task_url, user_id, state.get("root_post_id"), meta)
 
+    # 1) Обновляем исходное сообщение (где были кнопки дедлайна)
     mm_patch_post(
         post_id,
-        message=(
-            f'✅ Задача "{task_title}" создана.\n'
-            f"Ссылка: {task_url}\n"
-            f'Можете оставить дополнительный комментарий в треде, затем нажмите "Завершить".'
-        ),
+        message=f'Дедлайн для задачи "{task_title}": {deadline_human}.',
         attachments=attachments
     )
 
+    # 2) Отдельное сообщение "✅ Задача создана" в тред
+    channel_id_state = state.get("channel_id")
+    root_post_id = state.get("root_post_id")
+    if channel_id_state:
+        success_msg = (
+            f'✅ Задача "{task_title}" создана.\n'
+            f"Ссылка: {task_url}"
+        )
+        mm_post(
+            channel_id_state,
+            message=success_msg,
+            root_id=root_post_id
+        )
+
+    # 3) Обновляем state для FINISH / автозавершения
     set_state(user_id, state.get("root_post_id"), {
         "step": "OPTIONAL_ATTACH",
         "yougile_task_id": task_id,
         "task_url": task_url,
         "deadline_str": deadline_str,
     })
-
 
 def auto_finish_dialog(user_id, root_post_id):
     """
@@ -1930,7 +1972,10 @@ def run_ws_bot():
                             )
                             continue
 
-                        st = set_state(user_id, root_id, {"deadline": d})
+                        st = set_state(user_id, root_id, {
+                            "deadline": d,
+                            "deadline_display": text,  # <-- запомним ровно то, что ввёл пользователь
+                        })
                         task_title = st.get("task_title", "Без названия")
 
                         post_ids = st.get("post_ids") or []
