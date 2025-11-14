@@ -3,7 +3,7 @@
 """
 Loop (Mattermost) → YouGile бот.
 
-Функции:
+Функциональность:
 - При сообщении вида `@yougile_bot создай задачу <название>`
   запускает интерактивный мастер:
   проект → доска → колонка → исполнитель → дедлайн → создание задачи в YouGile.
@@ -11,9 +11,11 @@ Loop (Mattermost) → YouGile бот.
   - выбор стандартного дедлайна (сегодня / завтра / послезавтра / неделя / месяц),
   - кастомную дату YYYY-MM-DD,
   - необязательный дедлайн ("Без дедлайна"),
-  - отправку сообщений и файлов в чат задачи (chatId = taskId) из треда,
+  - отправку сообщений и файлов в чат задачи (chatId = taskId) из треда в Loop,
   - отмену создания задачи на любом шаге,
-  - автозавершение диалога, если пользователь забыл нажать "Завершить".
+  - автозавершение диалога, если пользователь забыл нажать "Завершить",
+  - проект по умолчанию для каждого канала Loop (с запросом при добавлении бота в канал
+    и управлением через главное меню бота).
 """
 
 import os
@@ -109,6 +111,7 @@ CHANNEL_PROJECT_MAP = {}  # channel_id -> {"project_id": ..., "project_title": .
 
 
 def load_channel_map():
+    """Загружает соответствие канал → проект по умолчанию из JSON-файла."""
     global CHANNEL_PROJECT_MAP
     if not CHANNEL_MAP_FILE:
         CHANNEL_PROJECT_MAP = {}
@@ -124,6 +127,7 @@ def load_channel_map():
 
 
 def save_channel_map():
+    """Сохраняет соответствие канал → проект по умолчанию в JSON-файл."""
     if not CHANNEL_MAP_FILE:
         return
     tmp_path = CHANNEL_MAP_FILE + ".tmp"
@@ -136,13 +140,16 @@ def save_channel_map():
 
 
 def get_default_project_for_channel(channel_id):
+    """Возвращает запись о проекте по умолчанию для канала (или None)."""
     with CHANNEL_MAP_LOCK:
         entry = CHANNEL_PROJECT_MAP.get(channel_id)
         if not entry:
             return None
         return entry  # {"project_id": ..., "project_title": ...}
 
+
 def set_default_project_for_channel(channel_id, project_id, project_title):
+    """Устанавливает проект по умолчанию для канала и сохраняет в файл."""
     with CHANNEL_MAP_LOCK:
         CHANNEL_PROJECT_MAP[channel_id] = {
             "project_id": project_id,
@@ -150,11 +157,14 @@ def set_default_project_for_channel(channel_id, project_id, project_title):
         }
         save_channel_map()
 
+
 def delete_default_project_for_channel(channel_id):
+    """Удаляет проект по умолчанию для указанного канала (если был)."""
     with CHANNEL_MAP_LOCK:
         if channel_id in CHANNEL_PROJECT_MAP:
             CHANNEL_PROJECT_MAP.pop(channel_id, None)
             save_channel_map()
+
 
 def set_state(user_id, root_post_id, data: dict):
     """
@@ -172,7 +182,7 @@ def set_state(user_id, root_post_id, data: dict):
 
 
 def get_state(user_id, root_post_id):
-    """Возвращает состояние мастера, если есть."""
+    """Возвращает состояние мастера, если есть, иначе None."""
     with STATE_LOCK:
         return STATE.get((user_id, root_post_id))
 
@@ -186,11 +196,13 @@ def clear_state(user_id, root_post_id):
 # ---------------------------------------------------------------------------
 #  Помощники для Loop (Mattermost)
 # ---------------------------------------------------------------------------
+
 def mm_get_me():
     """Получить данные текущего пользователя (бота) по токену."""
     r = requests.get(f"{MM_URL}/api/v4/users/me", headers=mm_headers, timeout=10)
     r.raise_for_status()
     return r.json()
+
 
 def get_bot_user_id():
     """Лениво получить и закешировать user_id бота."""
@@ -205,6 +217,7 @@ def get_bot_user_id():
         BOT_USER_ID = None
     return BOT_USER_ID
 
+
 def mm_get_user(user_id):
     """Получить данные пользователя по user_id."""
     url = f"{MM_URL}/api/v4/users/{user_id}"
@@ -212,12 +225,14 @@ def mm_get_user(user_id):
     r.raise_for_status()
     return r.json()
 
+
 def mm_get_channel(channel_id):
-    """Получить данные канала (нужно для красивого имени чата)."""
+    """Получить данные канала (для красивого имени чата)."""
     url = f"{MM_URL}/api/v4/channels/{channel_id}"
     r = requests.get(url, headers=mm_headers, timeout=10)
     r.raise_for_status()
     return r.json()
+
 
 def mm_post(channel_id, message, attachments=None, root_id=None):
     """
@@ -257,9 +272,12 @@ def mm_patch_post(post_id, message=None, attachments=None):
     r.raise_for_status()
     return r.json()
 
+
 def mm_post_ephemeral(user_id, channel_id, message, attachments=None, root_id=None):
     """
     Отправить ephemeral-сообщение (видно только одному пользователю).
+    В текущей версии логики для запросов по проекту по умолчанию используется обычный пост,
+    но этот метод оставлен на будущее.
     """
     post = {
         "channel_id": channel_id,
@@ -285,13 +303,14 @@ def mm_post_ephemeral(user_id, channel_id, message, attachments=None, root_id=No
     r.raise_for_status()
     return r.json()
 
+
 def mm_add_reaction(user_id, post_id, emoji_name):
     """Поставить реакцию на сообщение в Loop (Mattermost) от имени бота."""
     bot_id = get_bot_user_id()
 
     payload = {
-        # даже если нам передали user_id автора,
-        # реакция должна ставиться именно ботом
+        # Даже если нам передали user_id автора,
+        # реакция должна ставиться именно ботом.
         "user_id": bot_id or user_id,
         "post_id": post_id,
         "emoji_name": emoji_name,
@@ -355,6 +374,7 @@ def parse_create_command(message: str, bot_username: str):
         return None
     return m.group(1).strip()
 
+
 def extract_selected_value(data):
     """
     Унифицированно достаёт value выбранной опции из payload интерактивного экшена Mattermost.
@@ -370,12 +390,13 @@ def extract_selected_value(data):
         return raw.get("value")
     return raw
 
+
 # ---------------------------------------------------------------------------
 #  Обёртки над YouGile API (проекты / доски / задачи / чат / файлы)
 # ---------------------------------------------------------------------------
 
 def yg_get_projects():
-    """GET /projects — список проектов."""
+    """GET /projects — список проектов компании в YouGile."""
     r = requests.get(f"{YOUGILE_BASE_URL}/projects", headers=yg_headers, timeout=10)
     r.raise_for_status()
     data = r.json()
@@ -429,7 +450,7 @@ def yg_get_project_users(project_id=None):
     if isinstance(data, list):
         return data
 
-    print("DEBUG yg_get_project_users unexpected type:", type(data), data)
+    # Некорректный формат ответа — просто вернём пустой список.
     return []
 
 
@@ -479,7 +500,7 @@ def yg_create_task(title, column_id, description="", assignee_id=None, deadline=
 
 
 def yg_get_task(task_id):
-    """GET /tasks/{id} — полная карточка задачи (используем только для idTaskProject/idTaskCommon)."""
+    """GET /tasks/{id} — полная карточка задачи (для получения idTaskProject/idTaskCommon, если нужно)."""
     r = requests.get(
         f"{YOUGILE_BASE_URL}/tasks/{task_id}",
         headers=yg_headers,
@@ -494,14 +515,12 @@ def yg_send_chat_message(chat_id, text):
     Отправить сообщение в чат задачи.
     В YouGile chatId = taskId.
 
-    Согласно доке:
     POST /api-v2/chats/{chatId}/messages
     """
     payload = {
         "text": text,
     }
 
-    # YOUGILE_BASE_URL уже вида https://ru.yougile.com/api-v2
     url = f"{YOUGILE_BASE_URL}/chats/{chat_id}/messages"
 
     r = requests.post(
@@ -512,6 +531,7 @@ def yg_send_chat_message(chat_id, text):
     )
 
     if "application/json" not in r.headers.get("Content-Type", ""):
+        # Редкий случай: YouGile вернул что-то не JSON — просто логируем
         print("YG chat send non-JSON response:", r.status_code, r.text[:500])
 
     r.raise_for_status()
@@ -526,9 +546,7 @@ def yg_upload_file(file_bytes, filename, mimetype="application/octet-stream"):
     Загрузить файл в YouGile и вернуть относительный URL вида
     /user-data/.../file.ext
 
-    Согласно доке используется:
-    POST /api-v2/upload-file
-    с multipart/form-data.
+    POST /api-v2/upload-file (multipart/form-data).
     """
     files = {
         "file": (filename, file_bytes, mimetype),
@@ -567,6 +585,7 @@ def yg_upload_file(file_bytes, filename, mimetype="application/octet-stream"):
         raise RuntimeError("YouGile file upload JSON has no 'url' field")
 
     return file_url
+
 
 def get_allowed_projects_for_mm_user(user_id):
     """
@@ -612,7 +631,7 @@ def get_allowed_projects_for_mm_user(user_id):
     allowed_projects = []
 
     for p in all_projects:
-        # опционально можно сразу отфильтровать удалённые проекты
+        # Можно сразу отфильтровать удалённые проекты
         if p.get("deleted"):
             continue
 
@@ -653,6 +672,7 @@ def calc_deadline(choice: str) -> date:
         return today + timedelta(days=30)
     # fallback: сегодня
     return today
+
 
 def format_deadline(choice: str, deadline: date | None, raw_display: str | None = None):
     """
@@ -698,9 +718,9 @@ def format_deadline(choice: str, deadline: date | None, raw_display: str | None 
 def build_task_summary(task_title, project_title, board_title, assignee_name, deadline_str, task_url=None):
     """
     Строит единообразное summary задачи:
-    Задача "<title>" создана в проекте: <project>, доска: <board>, 
+    Задача "<title>" создана в проекте: <project>, доска: <board>,
     ответственный: <assignee>, дедлайн: <deadline>.
-    + при наличии добавляет ссылку.
+    При наличии добавляет ссылку.
     """
     summary = (
         f'Задача "{task_title}" создана в проекте: {project_title}, '
@@ -710,6 +730,7 @@ def build_task_summary(task_title, project_title, board_title, assignee_name, de
     if task_url:
         summary += f"\nСсылка: {task_url}"
     return summary
+
 
 def send_task_summary(channel_id, root_post_id, summary, *, to_channel=False, auto=False):
     """
@@ -739,6 +760,7 @@ def send_task_summary(channel_id, root_post_id, summary, *, to_channel=False, au
             message="(Автозавершение диалога)",
             root_id=root_post_id
         )
+
 
 def add_cancel_action(actions, task_title, root_post_id, user_id):
     """
@@ -797,7 +819,8 @@ def build_project_select_for_task(task_title, projects, user_id, root_post_id):
         "text": "Проект:",
         "actions": add_cancel_action([select_action], task_title, root_post_id, user_id)
     }]
-    
+
+
 def build_board_select_for_task(task_title, project_id, boards, user_id, root_post_id):
     """
     Выпадающий список досок для выбранного проекта.
@@ -834,7 +857,8 @@ def build_board_select_for_task(task_title, project_id, boards, user_id, root_po
         "text": "Доска:",
         "actions": add_cancel_action([select_action], task_title, root_post_id, user_id)
     }]
-    
+
+
 def build_column_select_for_task(task_title, project_id, board_id, columns, user_id, root_post_id):
     """
     Выпадающий список колонок для выбранной доски.
@@ -976,7 +1000,8 @@ def build_finish_buttons(task_title, task_url, user_id, root_post_id, meta):
         ),
         "actions": actions
     }]
-    
+
+
 def build_main_menu_attachments(user_id, root_post_id):
     """
     Главное меню бота:
@@ -1043,7 +1068,7 @@ def build_main_menu_attachments(user_id, root_post_id):
     ]
 
     return [{
-        "text": "",  # раньше было "Привет! Вот что я умею:"
+        "text": "",
         "actions": actions
     }]
 
@@ -1057,17 +1082,19 @@ app = Flask(__name__)
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
-    """Простой healthcheck."""
+    """Простой healthcheck для оркестратора / мониторинга."""
     return "ok", 200
 
 
 @app.route("/mattermost/actions", methods=["POST"])
 def mm_actions():
     """
-    Обработчик интерактивных действий:
-    - выбор проекта / доски / колонки / исполнителя / дедлайна
-    - отмена
-    - ручное завершение диалога
+    Обработчик интерактивных действий Mattermost:
+    - главное меню бота,
+    - выбор / сброс проекта по умолчанию,
+    - выбор проекта / доски / колонки / исполнителя / дедлайна,
+    - отмена мастера,
+    - ручное завершение диалога после создания задачи.
     """
     data = request.get_json(force=True, silent=True) or {}
     context = data.get("context", {}) or {}
@@ -1159,6 +1186,7 @@ def mm_actions():
                 "project_options": project_options,
             })
 
+            # "Не выбирать проект автоматически" — последним пунктом в списке
             options = [
                 {"text": title, "value": pid}
                 for pid, title in project_options.items()
@@ -1259,8 +1287,8 @@ def mm_actions():
             )
             clear_state(user_id, root_post_id)
             return "", 200
-        
-        # ---------- ВОПРОС ПРО ПРОЕКТ ПО УМОЛЧАНИЮ (ПРИ ДОБАВЛЕНИИ В КАНАЛ) ----------
+
+        # ---------- ВОПРОС ПРО ПРОЕКТ ПО УМОЛЧАНИЮ (ПРИ ДОБАВЛЕНИИ БОТА В КАНАЛ) ----------
         elif step == "DEFAULT_PROJECT_PROMPT_NO":
             # Пользователь явно отказался от проекта по умолчанию → чистим мэппинг
             delete_default_project_for_channel(channel_id)
@@ -1276,7 +1304,7 @@ def mm_actions():
             return "", 200
 
         elif step == "DEFAULT_PROJECT_PROMPT_YES":
-            # user_id здесь - тот, кто нажал кнопку
+            # user_id здесь — тот, кто нажал кнопку
             allowed_projects = get_allowed_projects_for_mm_user(user_id)
             if not allowed_projects:
                 mm_post(
@@ -1298,7 +1326,7 @@ def mm_actions():
                 "project_options": project_options,
             })
 
-            # --- ВСТАВЛЯЕМ опцию "Не выбирать проект автоматически" ПЕРВОЙ ---
+            # "Не выбирать проект автоматически" ПЕРВОЙ
             options = [
                 {"text": "Не выбирать проект автоматически", "value": "__none__"},
             ] + [
@@ -1325,7 +1353,7 @@ def mm_actions():
                 "actions": [select_action]
             }]
 
-            # ВАЖНО: обновляем ИСХОДНОЕ ephemeral, НЕ создаём новое сообщение
+            # Обновляем исходный пост с кнопками "Да/Нет"
             mm_patch_post(
                 post_id,
                 message="Проект по умолчанию:",
@@ -1363,8 +1391,8 @@ def mm_actions():
 
             clear_state(user_id, root_post_id)
             return "", 200
-        
-        # ---------- ВЫБОР ПРОЕКТА (через select) ----------
+
+        # ---------- ВЫБОР ПРОЕКТА (через select мастера) ----------
         elif step == "CHOOSE_PROJECT":
             project_id = extract_selected_value(data)
             if not project_id:
@@ -1595,6 +1623,7 @@ def mm_actions():
             })
 
             if deadline_choice == "custom":
+                # Пользователь должен ввести дату текстом
                 mm_patch_post(
                     post_id,
                     message=(
@@ -1622,6 +1651,7 @@ def mm_actions():
             post_ids = state.get("post_ids", [])
             task_title = context.get("task_title") or state.get("task_title") or "Без названия"
 
+            # Удаляем все служебные сообщения мастера
             for pid in post_ids:
                 try:
                     requests.delete(
@@ -1676,7 +1706,7 @@ def mm_actions():
                 auto=False,
             )
 
-            # 3) Обновляем интерактивный пост
+            # Обновляем интерактивный пост
             mm_patch_post(
                 post_id,
                 message=f'Диалог по задаче "{task_title}" завершён.',
@@ -1770,7 +1800,7 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
     post_ids = state.get("post_ids") or []
 
     # 1) Обновляем исходное сообщение (где были кнопки дедлайна).
-    #    ВАЖНО: attachments убираем — на этом сообщении больше ничего интерактивного не нужно.
+    #    attachments убираем — на этом сообщении больше ничего интерактивного не нужно.
     mm_patch_post(
         post_id,
         message=f'Дедлайн для задачи "{task_title}": {deadline_str}.',
@@ -1803,6 +1833,7 @@ def create_task_and_update_post(task_title, state, user_id, post_id):
         "deadline_str": deadline_str,
         "post_ids": post_ids,
     })
+
 
 def auto_finish_dialog(user_id, root_post_id):
     """
@@ -1843,17 +1874,18 @@ def auto_finish_dialog(user_id, root_post_id):
     )
 
     clear_state(user_id, root_post_id)
-    
+
+
 def start_task_creation(user_id, channel_id, root_id, title):
     """
     Запуск мастера создания задачи:
-    - определяем проекты YouGile, к которым пользователь имеет доступ
-    - учитываем проект по умолчанию для канала (если задан)
-    - дальше: выбор доски, колонки, исполнителя, дедлайна
+    - определяем проекты YouGile, к которым пользователь имеет доступ,
+    - учитываем проект по умолчанию для канала (если задан),
+    - дальше: выбор доски, колонки, исполнителя, дедлайна.
     """
     allowed_projects = get_allowed_projects_for_mm_user(user_id)
 
-    # 4) нет доступных проектов
+    # нет доступных проектов
     if not allowed_projects:
         no_access_msg = (
             "Извините, но кажется у вас нет доступа к проектам в нашей доске YouGile.\n"
@@ -1867,7 +1899,7 @@ def start_task_creation(user_id, channel_id, root_id, title):
         )
         return
 
-    # 5) проверяем проект по умолчанию для этого канала
+    # проверяем проект по умолчанию для этого канала
     default_entry = get_default_project_for_channel(channel_id)
     default_project = None
     if default_entry:
@@ -1984,7 +2016,13 @@ def start_task_creation(user_id, channel_id, root_id, title):
 # ---------------------------------------------------------------------------
 
 def run_ws_bot():
-    """Подключение к WebSocket и обработка событий posted."""
+    """
+    Подключение к WebSocket Loop (Mattermost) и обработка событий "posted":
+    - системные события добавления/удаления бота из канала,
+    - упоминание бота и запуск мастера/главного меню,
+    - обработка текстового ввода (название задачи, кастомный дедлайн),
+    - пересылка сообщений/файлов из треда в чат задачи YouGile.
+    """
     ws_url = MM_URL.replace("https", "wss").replace("http", "ws") + "/api/v4/websocket"
     seq = 1
 
@@ -2012,14 +2050,12 @@ def run_ws_bot():
                 try:
                     data = json.loads(msg)
                 except Exception as e:
-                    print("WS json error:", e, msg[:200])
+                    print("WS json error:", e, str(msg)[:200])
                     continue
 
                 event = data.get("event")
-                if event:
-                    print("WS event:", event, "data:", data.get("data", {}))
 
-                # --- Обрабатываем только posted ---
+                # Обрабатываем только новые посты
                 if event != "posted":
                     continue
 
@@ -2039,8 +2075,6 @@ def run_ws_bot():
                 # Бота ДОБАВИЛИ в канал → спросить про проект по умолчанию
                 if post_type == "system_add_to_channel":
                     added_user_id = props.get("addedUserId")
-                    # кто добавил бота
-                    adder_user_id = props.get("userId") or props.get("user_id")
                     if bot_id and added_user_id == bot_id and channel_id:
                         prompt = (
                             "Я только что добавлен в этот канал.\n"
@@ -2087,7 +2121,6 @@ def run_ws_bot():
                 if post_type == "system_remove_from_channel":
                     removed_user_id = props.get("removedUserId")
                     if bot_id and removed_user_id == bot_id and channel_id:
-                        print(f"Bot removed from channel {channel_id}, deleting default project mapping")
                         delete_default_project_for_channel(channel_id)
                     continue
 
@@ -2096,11 +2129,11 @@ def run_ws_bot():
                     title = parse_create_command(message, MM_BOT_USERNAME)
 
                     if title:
-                        # быстрая команда: сразу запускаем мастер
+                        # Быстрая команда: сразу запускаем мастер
                         start_task_creation(user_id, channel_id, root_id, title)
                         continue
 
-                    # иначе показываем главное меню
+                    # Иначе показываем главное меню
                     attachments = build_main_menu_attachments(user_id, root_id)
                     mm_post(
                         channel_id,
@@ -2231,6 +2264,7 @@ def run_ws_bot():
                         except Exception as e:
                             print("Error adding MM reaction:", e)
 
+                        # Сбрасываем state для данного шага — комментарий обработан
                         set_state(user_id, root_id, {})
 
         except WebSocketConnectionClosedException:
@@ -2240,8 +2274,9 @@ def run_ws_bot():
             print("WS error:", e)
             time.sleep(5)
 
+
 def start_ws_thread():
-    """Стартуем отдельный поток для WebSocket-бота."""
+    """Стартует отдельный поток для WebSocket-бота."""
     t = threading.Thread(target=run_ws_bot, daemon=True)
     t.start()
 
@@ -2278,7 +2313,7 @@ def auto_cleanup_loop():
 
 
 def start_cleanup_thread():
-    """Стартуем отдельный поток авто-уборки."""
+    """Стартует отдельный поток авто-уборки диалогов."""
     t = threading.Thread(target=auto_cleanup_loop, daemon=True)
     t.start()
 
