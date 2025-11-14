@@ -1160,10 +1160,10 @@ def mm_actions():
             })
 
             options = [
-                {"text": "Не выбирать проект автоматически", "value": "__none__"},
-            ] + [
                 {"text": title, "value": pid}
                 for pid, title in project_options.items()
+            ] + [
+                {"text": "Не выбирать проект автоматически", "value": "__none__"},
             ]
 
             select_action = {
@@ -1262,12 +1262,17 @@ def mm_actions():
         
         # ---------- ВОПРОС ПРО ПРОЕКТ ПО УМОЛЧАНИЮ (ПРИ ДОБАВЛЕНИИ В КАНАЛ) ----------
         elif step == "DEFAULT_PROJECT_PROMPT_NO":
-            # было mm_post(...)
+            # Пользователь явно отказался от проекта по умолчанию → чистим мэппинг
+            delete_default_project_for_channel(channel_id)
+
+            # Обновляем текущее сообщение (где были кнопки) и выключаем их
             mm_patch_post(
                 post_id,
                 message="Ок, проект по умолчанию для этого чата не установлен. Буду спрашивать проект при создании задач.",
-                attachments=[]  # выключаем кнопки
+                attachments=[]
             )
+
+            clear_state(user_id, root_post_id)
             return "", 200
 
         elif step == "DEFAULT_PROJECT_PROMPT_YES":
