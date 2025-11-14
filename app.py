@@ -72,7 +72,7 @@ if not (MM_URL and MM_BOT_TOKEN and YOUGILE_COMPANY_ID and YOUGILE_API_KEY and B
     print("ERROR: some required env vars are missing (MM_URL / MM_BOT_TOKEN / YOUGILE_* / BOT_PUBLIC_URL)")
     # Не выходим, чтобы это было видно в логах, но бот работать не будет.
 
-YOUGILE_FILE_UPLOAD_PATH = os.getenv("YOUGILE_FILE_UPLOAD_PATH", "/files/uploadFile")
+BOT_USER_ID = None
 
 # ---------------------------------------------------------------------------
 #  HTTP-заголовки
@@ -130,6 +130,24 @@ def clear_state(user_id, root_post_id):
 # ---------------------------------------------------------------------------
 #  Помощники для Loop (Mattermost)
 # ---------------------------------------------------------------------------
+def mm_get_me():
+    """Получить данные текущего пользователя (бота) по токену."""
+    r = requests.get(f"{MM_URL}/api/v4/users/me", headers=mm_headers, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def get_bot_user_id():
+    """Лениво получить и закешировать user_id бота."""
+    global BOT_USER_ID
+    if BOT_USER_ID:
+        return BOT_USER_ID
+    try:
+        me = mm_get_me()
+        BOT_USER_ID = me.get("id")
+    except Exception as e:
+        print("Error getting bot user id:", e)
+        BOT_USER_ID = None
+    return BOT_USER_ID
 
 def mm_get_user(user_id):
     """Получить данные пользователя по user_id."""
@@ -178,9 +196,13 @@ def mm_patch_post(post_id, message=None, attachments=None):
     return r.json()
 
 def mm_add_reaction(user_id, post_id, emoji_name):
-    """Поставить реакцию на сообщение в Loop (Mattermost)."""
+    """Поставить реакцию на сообщение в Loop (Mattermost) от имени бота."""
+    bot_id = get_bot_user_id()
+
     payload = {
-        "user_id": user_id,
+        # даже если нам передали user_id автора,
+        # реакция должна ставиться именно ботом
+        "user_id": bot_id or user_id,
         "post_id": post_id,
         "emoji_name": emoji_name,
     }
@@ -393,22 +415,21 @@ def yg_upload_file(file_bytes, filename, mimetype="application/octet-stream"):
     Загрузить файл в YouGile и вернуть относительный URL вида
     /user-data/.../file.ext
 
-    Путь берём из YOUGILE_FILE_UPLOAD_PATH, по умолчанию /files/uploadFile.
-    В Swagger по операции FileController_uploadFile указано точное значение —
-    при расхождении поправь ENV.
+    Согласно доке используется:
+    POST /api-v2/upload-file
+    с multipart/form-data.
     """
     files = {
         "file": (filename, file_bytes, mimetype),
     }
 
-    # для multipart заголовок Content-Type ставит сам requests
+    # Для multipart заголовок Content-Type ставит сам requests,
+    # поэтому убираем его из yg_headers
     headers = dict(yg_headers)
     headers.pop("Content-Type", None)
 
-    url = f"{YOUGILE_BASE_URL}{YOUGILE_FILE_UPLOAD_PATH}"
-
     r = requests.post(
-        url,
+        f"{YOUGILE_BASE_URL}/upload-file",
         headers=headers,
         files=files,
         timeout=30,
@@ -432,7 +453,7 @@ def yg_upload_file(file_bytes, filename, mimetype="application/octet-stream"):
     )
     if not file_url:
         print("YG upload unexpected JSON:", data)
-        raise RuntimeError("YouGile file upload JSON has no 'url'/'path'/'fileUrl' field")
+        raise RuntimeError("YouGile file upload JSON has no 'url' field")
 
     return file_url
 
