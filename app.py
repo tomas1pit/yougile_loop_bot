@@ -2070,23 +2070,12 @@ def run_ws_bot():
                             ]
                         }]
 
-                        # если знаем, кто добавил — шлём ephemeral именно ему
-                        if adder_user_id:
-                            mm_post_ephemeral(
-                                adder_user_id,
-                                channel_id,
-                                message=prompt,
-                                attachments=attachments,
-                                root_id=None
-                            )
-                        else:
-                            # fallback — обычное сообщение в канал
-                            mm_post(
-                                channel_id,
-                                message=prompt,
-                                attachments=attachments,
-                                root_id=None
-                            )
+                        mm_post(
+                            channel_id,
+                            message=prompt,
+                            attachments=attachments,
+                            root_id=None
+                        )
                     continue
 
                 # Бота УДАЛИЛИ из канала → чистим мэппинг
