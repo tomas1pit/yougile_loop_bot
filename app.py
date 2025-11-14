@@ -176,6 +176,44 @@ def mm_patch_post(post_id, message=None, attachments=None):
     r.raise_for_status()
     return r.json()
 
+def mm_add_reaction(user_id, post_id, emoji_name):
+    """Поставить реакцию на сообщение в Loop (Mattermost)."""
+    payload = {
+        "user_id": user_id,
+        "post_id": post_id,
+        "emoji_name": emoji_name,
+    }
+    r = requests.post(
+        f"{MM_URL}/api/v4/reactions",
+        headers=mm_headers,
+        json=payload,
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def mm_get_file(file_id):
+    """Скачать файл из Loop по file_id."""
+    r = requests.get(
+        f"{MM_URL}/api/v4/files/{file_id}",
+        headers=mm_headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.content
+
+
+def mm_get_file_info(file_id):
+    """Получить метаданные файла из Loop (имя, mime и т.п.)."""
+    r = requests.get(
+        f"{MM_URL}/api/v4/files/{file_id}/info",
+        headers=mm_headers,
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
+
 
 def decode_mm_post_from_event(data):
     """Парсит JSON-представление поста из события websocket."""
@@ -319,45 +357,76 @@ def yg_get_task(task_id):
 
 def yg_send_chat_message(chat_id, text):
     """
-    Отправка текстового сообщения в чат задачи.
-    chatId = taskId.
-
-    NB: проверь по Swagger точный путь:
-        здесь предполагается POST /chats/{chatId}/messages
+    Отправить сообщение в чат задачи.
+    В YouGile chatId = taskId.
     """
-    body = {"text": text}
+    payload = {
+        "chatId": chat_id,
+        "text": text,
+    }
     r = requests.post(
-        f"{YOUGILE_BASE_URL}/chats/{chat_id}/messages",
+        f"{YOUGILE_BASE_URL}/chats/messages",
         headers=yg_headers,
-        json=body,
+        json=payload,
         timeout=10,
     )
+    # на случай, если сервер вернёт HTML/ошибку
+    if "application/json" not in r.headers.get("Content-Type", ""):
+        print("YG chat send non-JSON response:", r.status_code, r.text[:500])
     r.raise_for_status()
-    return r.json()
+    try:
+        return r.json()
+    except ValueError:
+        # если JSON нет — просто возвращаем пустой dict
+        return {}
 
 
-def yg_upload_file(file_bytes, filename, content_type="application/octet-stream"):
+def yg_upload_file(file_bytes, filename, mimetype="application/octet-stream"):
     """
-    Загрузка файла в YouGile.
+    Загрузить файл в YouGile и вернуть относительный URL вида
+    /user-data/.../file.ext
 
-    NB: путь предполагается /files. Если в Swagger другой (например /files/upload),
+    ВАЖНО: если у тебя в Swagger другой путь (например /files/uploadFile),
     просто поправь URL ниже.
     """
-    # Для multipart нельзя жёстко ставить Content-Type, поэтому копируем заголовки без него
-    headers = {k: v for k, v in yg_headers.items() if k.lower() != "content-type"}
-
     files = {
-        "file": (filename, file_bytes, content_type),
+        "file": (filename, file_bytes, mimetype),
     }
+    # Для multipart заголовок Content-Type ставит сам requests,
+    # поэтому убираем его из yg_headers
+    headers = dict(yg_headers)
+    headers.pop("Content-Type", None)
 
+    # Путь можно скорректировать по Swagger, если будет 404
     r = requests.post(
         f"{YOUGILE_BASE_URL}/files",
         headers=headers,
         files=files,
         timeout=30,
     )
+    if "application/json" not in r.headers.get("Content-Type", ""):
+        print("YG upload non-JSON response:", r.status_code, r.text[:500])
     r.raise_for_status()
-    return r.json()
+
+    try:
+        data = r.json()
+    except ValueError:
+        # сюда мы как раз и попадали: HTML/пустой ответ
+        raise RuntimeError(
+            f"YouGile file upload returned non-JSON response (status {r.status_code})"
+        )
+
+    # в доках написано, что там есть поле url
+    file_url = (
+        data.get("url")
+        or data.get("path")
+        or data.get("fileUrl")
+    )
+    if not file_url:
+        print("YG upload unexpected JSON:", data)
+        raise RuntimeError("YouGile file upload JSON has no 'url' field")
+
+    return file_url
 
 
 # ---------------------------------------------------------------------------
@@ -1167,59 +1236,70 @@ def run_ws_bot():
                             )
                         continue
 
-                # ---------- 3) Дополнительные сообщения/файлы после создания задачи ----------
+                # ---------- 3) Дополнительные комментарии / файлы после создания задачи ----------
                 st = get_state(user_id, root_id)
                 if st and st.get("step") == "OPTIONAL_ATTACH":
                     task_id = st.get("yougile_task_id")
                     if not task_id:
                         continue
 
-                    chat_id = task_id
-                    text = message.strip()
-                    file_ids = post.get("file_ids") or []
+                    sent_anything = False
 
+                    # данные пользователя Loop для префикса
                     try:
-                        # Текст в чат задачи
-                        if text:
-                            yg_send_chat_message(chat_id, text)
-
-                        # Файлы из Loop → YouGile + сообщение /root/#file:<url>
-                        for fid in file_ids:
-                            try:
-                                meta_resp = requests.get(
-                                    f"{MM_URL}/api/v4/files/{fid}",
-                                    headers=mm_headers,
-                                    timeout=10,
-                                )
-                                meta_resp.raise_for_status()
-                                meta = meta_resp.json()
-                                filename = meta.get("name") or meta.get("filename") or fid
-                                mime_type = meta.get("mime_type") or "application/octet-stream"
-
-                                file_resp = requests.get(
-                                    f"{MM_URL}/api/v4/files/{fid}/get",
-                                    headers=mm_headers,
-                                    timeout=30,
-                                )
-                                file_resp.raise_for_status()
-                                file_bytes = file_resp.content
-
-                                upload_info = yg_upload_file(file_bytes, filename, mime_type)
-                                file_url = upload_info.get("url")
-
-                                if file_url:
-                                    chat_text = f"/root/#file:{file_url}"
-                                    yg_send_chat_message(chat_id, chat_text)
-                                else:
-                                    print("YG upload: no 'url' in response:", upload_info)
-                            except Exception as fe:
-                                print("Error sending file to YouGile chat:", fe)
-
-                        # Обновляем updated_at для авто-завершения
-                        set_state(user_id, root_id, {})
-
+                        mm_user = mm_get_user(user_id)
                     except Exception as e:
-                        print("Error sending message to YouGile chat:", e)
+                        print("Error fetching MM user for comment prefix:", e)
+                        mm_user = {}
+
+                    first_name = (mm_user.get("first_name") or "").strip()
+                    last_name = (mm_user.get("last_name") or "").strip()
+                    username = mm_user.get("username") or ""
+                    full_name = (first_name + " " + last_name).strip() or username or "неизвестный пользователь"
+
+                    def prefix_text(text: str) -> str:
+                        return f"Пользователь {full_name} (@{username}) написал: {text}"
+
+                    # 3.1. Отправляем прикреплённые файлы (если есть)
+                    file_ids = post.get("file_ids") or []
+                    for fid in file_ids:
+                        try:
+                            file_bytes = mm_get_file(fid)
+                            info = mm_get_file_info(fid)
+                            filename = info.get("name") or info.get("id") or "file"
+                            mimetype = info.get("mime_type") or "application/octet-stream"
+
+                            # загружаем файл в YouGile и получаем относительный url
+                            yg_file_url = yg_upload_file(file_bytes, filename, mimetype)
+
+                            # формируем текст для чата: /root/#file:/user-data/...
+                            file_cmd = f"/root/#file:{yg_file_url}"
+                            chat_text = prefix_text(file_cmd)
+
+                            yg_send_chat_message(task_id, chat_text)
+                            sent_anything = True
+                        except Exception as e:
+                            print("Error sending file to YouGile chat:", e)
+
+                    # 3.2. Отправляем обычный текст, если он есть
+                    text = (message or "").strip()
+                    if text:
+                        try:
+                            chat_text = prefix_text(text)
+                            yg_send_chat_message(task_id, chat_text)
+                            sent_anything = True
+                        except Exception as e:
+                            print("Error sending text comment to YouGile chat:", e)
+
+                    # 3.3. Если хоть что-то удалось отправить — ставим реакцию ✅ в Loop
+                    if sent_anything:
+                        try:
+                            mm_add_reaction(user_id, post.get("id"), "white_check_mark")
+                        except Exception as e:
+                            print("Error adding MM reaction:", e)
+
+                        # обновляем updated_at, чтобы авто-завершение шло от последнего действия
+                        set_state(user_id, root_id, {})
 
         except WebSocketConnectionClosedException:
             print("WS closed, reconnecting in 3s...")
