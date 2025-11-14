@@ -1194,6 +1194,7 @@ def run_ws_bot():
                 if f"@{MM_BOT_USERNAME}" in message.lower():
                     title = parse_create_command(message, MM_BOT_USERNAME)
 
+                    # Если команда непонятна — показываем хелп
                     if not title:
                         help_text = (
                             ":huh: Привет!\n"
@@ -1209,7 +1210,59 @@ def run_ws_bot():
                         )
                         continue
 
-                    projects = yg_get_projects()
+                    # 1.1. Получаем email пользователя из Loop
+                    try:
+                        mm_user = mm_get_user(user_id)
+                        mm_email = (mm_user.get("email") or "").strip().lower()
+                    except Exception as e:
+                        print("Error fetching MM user for project filter:", e)
+                        mm_email = ""
+
+                    # 1.2. Получаем все проекты из YouGile
+                    try:
+                        all_projects = yg_get_projects()
+                    except Exception as e:
+                        print("Error fetching YouGile projects:", e)
+                        all_projects = []
+
+                    # 1.3. Фильтруем проекты по участию пользователя (по email)
+                    allowed_projects = []
+
+                    if mm_email:
+                        for p in all_projects:
+                            project_id = p.get("id")
+                            if not project_id:
+                                continue
+                            try:
+                                users = yg_get_project_users(project_id)
+                            except Exception as e:
+                                print(f"Error fetching users for project {project_id}:", e)
+                                continue
+
+                            for u in users:
+                                u_email = (u.get("email") or "").strip().lower()
+                                if u_email and u_email == mm_email:
+                                    allowed_projects.append(p)
+                                    break
+                    else:
+                        # У пользователя нет email в Loop — считаем, что нет доступа ни к одному проекту
+                        allowed_projects = []
+
+                    # 1.4. Если нет ни одного доступного проекта — завершаем диалог
+                    if not allowed_projects:
+                        no_access_msg = (
+                            "Извините, но кажется у вас нет доступа к проектам в нашей доске YouGile.\n"
+                            "Обратитесь за помощью к администратору.\n"
+                            "Мне очень жаль :cry:"
+                        )
+                        mm_post(
+                            channel_id,
+                            message=no_access_msg,
+                            root_id=root_id
+                        )
+                        continue
+
+                    # 1.5. Если проекты есть — запускаем мастер, как раньше
                     with STATE_LOCK:
                         STATE[(user_id, root_id)] = {
                             "step": "CHOOSE_PROJECT",
@@ -1219,7 +1272,7 @@ def run_ws_bot():
                             "post_ids": [],
                         }
 
-                    attachments = build_project_buttons(title, projects, user_id, root_id)
+                    attachments = build_project_buttons(title, allowed_projects, user_id, root_id)
                     resp = mm_post(
                         channel_id,
                         message=f'Выберите проект для задачи "{title}"',
