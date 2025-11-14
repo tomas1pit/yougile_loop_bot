@@ -72,6 +72,7 @@ if not (MM_URL and MM_BOT_TOKEN and YOUGILE_COMPANY_ID and YOUGILE_API_KEY and B
     print("ERROR: some required env vars are missing (MM_URL / MM_BOT_TOKEN / YOUGILE_* / BOT_PUBLIC_URL)")
     # Не выходим, чтобы это было видно в логах, но бот работать не будет.
 
+YOUGILE_FILE_UPLOAD_PATH = os.getenv("YOUGILE_FILE_UPLOAD_PATH", "/files/uploadFile")
 
 # ---------------------------------------------------------------------------
 #  HTTP-заголовки
@@ -359,25 +360,31 @@ def yg_send_chat_message(chat_id, text):
     """
     Отправить сообщение в чат задачи.
     В YouGile chatId = taskId.
+
+    Согласно доке:
+    POST /api-v2/chats/{chatId}/messages
     """
     payload = {
-        "chatId": chat_id,
         "text": text,
     }
+
+    # YOUGILE_BASE_URL уже вида https://ru.yougile.com/api-v2
+    url = f"{YOUGILE_BASE_URL}/chats/{chat_id}/messages"
+
     r = requests.post(
-        f"{YOUGILE_BASE_URL}/chats/messages",
+        url,
         headers=yg_headers,
         json=payload,
         timeout=10,
     )
-    # на случай, если сервер вернёт HTML/ошибку
+
     if "application/json" not in r.headers.get("Content-Type", ""):
         print("YG chat send non-JSON response:", r.status_code, r.text[:500])
+
     r.raise_for_status()
     try:
         return r.json()
     except ValueError:
-        # если JSON нет — просто возвращаем пустой dict
         return {}
 
 
@@ -386,24 +393,27 @@ def yg_upload_file(file_bytes, filename, mimetype="application/octet-stream"):
     Загрузить файл в YouGile и вернуть относительный URL вида
     /user-data/.../file.ext
 
-    ВАЖНО: если у тебя в Swagger другой путь (например /files/uploadFile),
-    просто поправь URL ниже.
+    Путь берём из YOUGILE_FILE_UPLOAD_PATH, по умолчанию /files/uploadFile.
+    В Swagger по операции FileController_uploadFile указано точное значение —
+    при расхождении поправь ENV.
     """
     files = {
         "file": (filename, file_bytes, mimetype),
     }
-    # Для multipart заголовок Content-Type ставит сам requests,
-    # поэтому убираем его из yg_headers
+
+    # для multipart заголовок Content-Type ставит сам requests
     headers = dict(yg_headers)
     headers.pop("Content-Type", None)
 
-    # Путь можно скорректировать по Swagger, если будет 404
+    url = f"{YOUGILE_BASE_URL}{YOUGILE_FILE_UPLOAD_PATH}"
+
     r = requests.post(
-        f"{YOUGILE_BASE_URL}/files",
+        url,
         headers=headers,
         files=files,
         timeout=30,
     )
+
     if "application/json" not in r.headers.get("Content-Type", ""):
         print("YG upload non-JSON response:", r.status_code, r.text[:500])
     r.raise_for_status()
@@ -411,12 +421,10 @@ def yg_upload_file(file_bytes, filename, mimetype="application/octet-stream"):
     try:
         data = r.json()
     except ValueError:
-        # сюда мы как раз и попадали: HTML/пустой ответ
         raise RuntimeError(
             f"YouGile file upload returned non-JSON response (status {r.status_code})"
         )
 
-    # в доках написано, что там есть поле url
     file_url = (
         data.get("url")
         or data.get("path")
@@ -424,7 +432,7 @@ def yg_upload_file(file_bytes, filename, mimetype="application/octet-stream"):
     )
     if not file_url:
         print("YG upload unexpected JSON:", data)
-        raise RuntimeError("YouGile file upload JSON has no 'url' field")
+        raise RuntimeError("YouGile file upload JSON has no 'url'/'path'/'fileUrl' field")
 
     return file_url
 
